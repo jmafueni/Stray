@@ -1,0 +1,115 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+  }
+
+  .font-editorial {
+    font-family: 'Fraunces', Georgia, serif;
+  }
+}
+
+/* Tactile Paper & Ink Cartographic Filters */
+.map-tiles-paper .leaflet-tile-pane {
+  filter: sepia(0.18) contrast(0.96) brightness(1.01) saturate(0.85);
+  transition: filter 0.3s ease;
+}
+
+.map-tiles-dark .leaflet-tile-pane {
+  filter: contrast(1.06) brightness(0.92) saturate(0.85);
+  transition: filter 0.3s ease;
+}
+
+/* Custom Editorial Numbered & Terminal DivIcon Markers */
+.stray-editorial-marker {
+  background: transparent !important;
+  border: none !important;
+}
+
+/* Editorial Paper & Ink Leaflet Popups */
+.leaflet-popup-content-wrapper {
+  border-radius: 16px !important;
+  padding: 2px 4px !important;
+  font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif !important;
+  background: rgba(244, 241, 234, 0.96) !important;
+  color: #1C1C1E !important;
+  border: 1px solid rgba(28, 28, 30, 0.14) !important;
+  box-shadow: 0 12px 32px rgba(28, 28, 30, 0.16) !important;
+  backdrop-filter: blur(12px);
+}
+
+.leaflet-popup-tip {
+  background: rgba(244, 241, 234, 0.96) !important;
+  border: 1px solid rgba(28, 28, 30, 0.12) !important;
+}
+
+.map-tiles-dark .leaflet-popup-content-wrapper {
+  background: rgba(24, 24, 27, 0.96) !important;
+  color: #F4F1EA !important;
+  border: 1px solid rgba(255, 255, 255, 0.14) !important;
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.65) !important;
+}
+
+.map-tiles-dark .leaflet-popup-tip {
+  background: rgba(24, 24, 27, 0.96) !important;
+  border: 1px solid rgba(255, 255, 255, 0.12) !important;
+}
+
+.leaflet-container a.leaflet-popup-close-button {
+  color: #78716c !important;
+  font-size: 16px !important;
+  padding: 6px 8px 0 0 !important;
+}
+
+.leaflet-container a.leaflet-popup-close-button:hover {
+  color: #FF6B4A !important;
+}
+
+/* Editorial Floating Tooltip Pills */
+.leaflet-tooltip.stray-label-tooltip {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  padding: 0 !important;
+}
+
+.leaflet-tooltip.stray-label-tooltip::before {
+  display: none !important;
+}
+
+/* Minimalist editorial attribution badge */
+.leaflet-control-attribution {
+  font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif !important;
+  font-size: 9px !important;
+  letter-spacing: 0.02em;
+  padding: 2px 8px !important;
+  border-radius: 9999px !important;
+  margin: 0 8px 6px 0 !important;
+  backdrop-filter: blur(8px);
+  background: rgba(244, 241, 234, 0.85) !important;
+  color: rgba(28, 28, 30, 0.65) !important;
+  border: 1px solid rgba(28, 28, 30, 0.1) !important;
+}
+
+.leaflet-control-attribution a {
+  color: inherit !important;
+  font-weight: 600;
+  text-decoration: none !important;
+}
+
+.map-tiles-dark .leaflet-control-attribution {
+  background: rgba(24, 24, 27, 0.85) !important;
+  color: rgba(244, 241, 234, 0.55) !important;
+  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}

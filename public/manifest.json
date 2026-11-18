@@ -1,0 +1,10 @@
+{
+  "name": "Stray — Urban Loop & POI Discovery",
+  "short_name": "Stray",
+  "description": "Generate spontaneous or planned urban walking and running loops around cultural micro-POIs.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0F0F12",
+  "theme_color": "#FF6B4A",
+  "orientation": "portrait"
+}
