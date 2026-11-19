@@ -3,13 +3,112 @@ import {
   getPOIsForRoute,
   fetchRealPOIsAlongRoute,
   calculateDetourMeters,
-  isGenericChain,
+  distanceMeters,
+  distanceToPolylineMeters,
 } from './pois.js';
 import { loadDriftHistory } from './storage.js';
 
-const MAPBOX_TOKEN = (import.meta.env?.VITE_MAPBOX_TOKEN || '').trim();
+const MAPBOX_TOKEN = (
+  import.meta.env?.VITE_MAPBOX_TOKEN ||
+  (typeof process !== 'undefined' ? process.env?.VITE_MAPBOX_TOKEN : '') ||
+  ''
+).trim();
 
-export const STEP_TO_KM_FACTOR = 0.00075; // 1,000 steps ≈ 0.75 km
+// Explicit, unified pace constants used across UI helpers, initial loop radius estimation,
+// fallback estimation, and Mapbox Directions evaluation:
+// - Walk mode: 4.8 km/h (80 m/min, ~115 steps/min -> 30 min = 2.40 km)
+// - Run mode:  9.6 km/h (160 m/min, ~165 steps/min -> 30 min = 4.80 km)
+export const PACE_CONFIG = {
+  walk: {
+    speedKmh: 4.8,
+    metersPerMin: 80,
+    stepsPerMin: 115,
+  },
+  run: {
+    speedKmh: 9.6,
+    metersPerMin: 160,
+    stepsPerMin: 165,
+  },
+};
+
+export const WALK_SPEED_KMH = PACE_CONFIG.walk.speedKmh;
+export const RUN_SPEED_KMH = PACE_CONFIG.run.speedKmh;
+export const WALK_METERS_PER_MIN = PACE_CONFIG.walk.metersPerMin; // 80 m/min
+export const RUN_METERS_PER_MIN = PACE_CONFIG.run.metersPerMin; // 160 m/min
+export const WALK_STEPS_PER_MIN = PACE_CONFIG.walk.stepsPerMin; // 115 steps/min
+export const RUN_STEPS_PER_MIN = PACE_CONFIG.run.stepsPerMin; // 165 steps/min
+
+// Derived stride lengths (km/step) consistent with speed & cadence constants
+export const WALK_STEP_TO_KM_FACTOR =
+  WALK_METERS_PER_MIN / 1000 / WALK_STEPS_PER_MIN;
+export const RUN_STEP_TO_KM_FACTOR =
+  RUN_METERS_PER_MIN / 1000 / RUN_STEPS_PER_MIN;
+export const STEP_TO_KM_FACTOR = WALK_STEP_TO_KM_FACTOR;
+
+export const MAX_POI_VERTEX_DISTANCE_METERS = 250;
+export const LOOP_CALIBRATION_TOLERANCE = 0.12;
+export const POI_DURATION_TOLERANCE = 0.15;
+
+export function getPaceConfig(activityMode = 'walk') {
+  return activityMode === 'run' ? PACE_CONFIG.run : PACE_CONFIG.walk;
+}
+
+/**
+ * Computes exact floating-point duration in minutes from actual route distance in meters.
+ */
+export function distanceMetersToMinutesExact(
+  routeDistanceMeters,
+  activityMode = 'walk'
+) {
+  const { metersPerMin } = getPaceConfig(activityMode);
+  return Math.max(0, Number(routeDistanceMeters) || 0) / metersPerMin;
+}
+
+/**
+ * Computes rounded display duration in minutes from actual route distance in meters
+ * (`Math.round(distanceMeters / metersPerMinute)`), so distance and minutes never contradict.
+ */
+export function distanceMetersToMinutes(
+  routeDistanceMeters,
+  activityMode = 'walk'
+) {
+  return Math.max(
+    1,
+    Math.round(distanceMetersToMinutesExact(routeDistanceMeters, activityMode))
+  );
+}
+
+/**
+ * Converts target duration in minutes to target distance in kilometers using unified pace.
+ * (e.g. Walk: 30 min -> 2.40 km; Run: 30 min -> 4.80 km)
+ */
+export function minutesToDistanceKm(minutes, activityMode = 'walk') {
+  const mins = Math.max(1, Number(minutes) || 30);
+  const { metersPerMin } = getPaceConfig(activityMode);
+  return Number(((mins * metersPerMin) / 1000).toFixed(2));
+}
+
+/**
+ * Converts target step count and activityMode to target duration in minutes.
+ * (e.g. Walk: 3,450 steps -> 30 min / 2.40 km; Run: 4,950 steps -> 30 min / 4.80 km)
+ */
+export function stepsToMinutes(steps, activityMode = 'walk') {
+  if (!steps || steps <= 0) return 15;
+  const { stepsPerMin } = getPaceConfig(activityMode);
+  return Math.max(5, Math.round(steps / stepsPerMin));
+}
+
+/**
+ * Converts target duration in minutes to step count aligned with unified cadence.
+ * (e.g. Walk: 15m -> 1,725, 30m -> 3,450, 45m -> 5,175, 60m -> 6,900;
+ *       Run:  15m -> 2,475, 30m -> 4,950, 45m -> 7,425, 60m -> 9,900)
+ */
+export function minutesToSteps(minutes, activityMode = 'walk') {
+  const mins = Math.max(5, Number(minutes) || 30);
+  const { stepsPerMin } = getPaceConfig(activityMode);
+  const rawSteps = Math.round(mins * stepsPerMin);
+  return Math.max(1500, Math.min(20000, rawSteps));
+}
 
 /**
  * Selects a compass bearing (in degrees) that prioritizes unexplored 45° sectors
@@ -27,17 +126,21 @@ function selectUnexploredBearingDeg(seed = 0, exploredSectors = []) {
 }
 
 /**
- * Converts target step count to kilometers (1,000 steps ≈ 0.75 km).
+ * Converts target step count to kilometers consistently with unified pace & cadence.
  */
-export function stepsToKm(steps) {
-  return Number((steps * STEP_TO_KM_FACTOR).toFixed(2));
+export function stepsToKm(steps, activityMode = 'walk') {
+  const { metersPerMin, stepsPerMin } = getPaceConfig(activityMode);
+  const km = ((Number(steps) || 0) / stepsPerMin) * (metersPerMin / 1000);
+  return Number(km.toFixed(2));
 }
 
 /**
- * Converts kilometers to estimated steps.
+ * Converts kilometers to estimated steps consistently with unified pace & cadence.
  */
-export function kmToSteps(km) {
-  return Math.round(km / STEP_TO_KM_FACTOR);
+export function kmToSteps(km, activityMode = 'walk') {
+  const { metersPerMin, stepsPerMin } = getPaceConfig(activityMode);
+  const minutes = ((Number(km) || 0) * 1000) / metersPerMin;
+  return Math.round(minutes * stepsPerMin);
 }
 
 /**
@@ -56,71 +159,96 @@ export function haversineKm([lat1, lng1], [lat2, lng2]) {
 
 /**
  * Editorial route variant configurations for simultaneous multi-route generation (Primary + 2 Secondary).
+ * All 3 variants keep `distanceScale` tightly anchored around 1.0 (0.96, 1.0, 1.04) so every proposed
+ * route honors the user's chosen time/step budget within ±12% while differing by compass sector,
+ * street geometry, and POI character.
  */
 export const ROUTE_VARIANT_SPECS = [
   {
     variantIndex: 0,
     variantKey: 'primary',
     variantLabel: 'Curated Drift',
-    variantBadge: 'Primary',
+    variantBadge: 'Balanced',
     distanceScale: 1.0,
+    bearingOffsetDeg: 0, // Primary unexplored compass sector
     sectorStep: 0,
     seedStep: 0,
     quietBonus: 0,
     corridorStyle: 'primary',
+    poiCharacter: 'balanced',
   },
   {
     variantIndex: 1,
     variantKey: 'quiet',
     variantLabel: 'Quiet Alleys',
-    variantBadge: '98% Calm',
-    distanceScale: 0.86,
-    sectorStep: 3, // ~135° shifted compass bearing
+    variantBadge: 'Calm & Green',
+    distanceScale: 0.96,
+    bearingOffsetDeg: 120, // +120° rotated compass sector in Loop, left-flank corridor in Point A -> B
+    sectorStep: 3,
     seedStep: 11,
-    quietBonus: 3,
-    corridorStyle: 'opposite',
+    quietBonus: 4,
+    corridorStyle: 'left_flank',
+    poiCharacter: 'calm_green',
   },
   {
     variantIndex: 2,
-    variantKey: 'scenic',
-    variantLabel: 'Scenic Arc',
-    variantBadge: 'Deep Explorer',
-    distanceScale: 1.2,
-    sectorStep: 5, // ~225° shifted compass bearing
+    variantKey: 'hidden_gems',
+    variantLabel: 'Hidden Gems',
+    variantBadge: 'Local Discovery',
+    distanceScale: 1.04,
+    bearingOffsetDeg: 240, // +240° opposite compass sector in Loop, right-flank corridor in Point A -> B
+    sectorStep: 5,
     seedStep: 29,
     quietBonus: 1,
-    corridorStyle: 'wide',
+    corridorStyle: 'right_flank',
+    poiCharacter: 'local_discovery',
   },
 ];
 
 /**
- * Generates 3 or 4 organic directional anchor waypoints around `origin`
- * scaled so the resulting street-routed loop matches the target step/distance budget.
+ * Resolves the deterministic compass bearing (degrees) for a loop variant.
  */
-function buildLoopAnchors(
-  origin,
-  targetKm,
-  activityMode,
+function resolveLoopBearingDeg(
   seed,
   exploredSectors = [],
-  sectorStep = 0
+  sectorStep = 0,
+  bearingOffsetDeg = null
+) {
+  const baseBearingDeg = selectUnexploredBearingDeg(seed, exploredSectors);
+  const rotationDeg =
+    typeof bearingOffsetDeg === 'number' ? bearingOffsetDeg : sectorStep * 45;
+  return (baseBearingDeg + rotationDeg) % 360;
+}
+
+/**
+ * Generates 3 or 4 organic directional anchor waypoints around `origin`
+ * along `bearingDeg` for a given loop span `radiusKm` (radial reach from origin to far apex,
+ * where initial `radiusKm = (targetDistanceKm * variant.distanceScale) / 2.75`).
+ */
+function buildLoopAnchorsForRadius(
+  origin,
+  radiusKm,
+  bearingDeg,
+  activityMode = 'walk',
+  seed = 0
 ) {
   const [originLat, originLng] = origin;
   const latPerKm = 1 / 111.32;
-  const lngPerKm = 1 / (111.32 * Math.cos((originLat * Math.PI) / 180));
+  const lngPerKm =
+    1 / (111.32 * Math.max(0.2, Math.cos((originLat * Math.PI) / 180)));
 
-  // Urban street networks add ~1.38x distance over straight-line polygon perimeter
-  const roadNetworkFactor = activityMode === 'walk' ? 1.42 : 1.32;
-  const effectiveCircumferenceKm = targetKm / roadNetworkFactor;
-  const radiusKm = Math.max(0.18, effectiveCircumferenceKm / (2 * Math.PI));
+  const clampedRadiusKm = Math.max(0.14, Math.min(10, Number(radiusKm) || 0.5));
+  // Circle passing through `origin` with diameter = `clampedRadiusKm` (circle radius = span / 2)
+  // gives a straight-line polygon perimeter of ~2.85 * clampedRadiusKm, matching street grid tortuosity
+  const circleRadiusKm = clampedRadiusKm / 2;
 
-  const baseBearingDeg = selectUnexploredBearingDeg(seed, exploredSectors);
-  const bearingDeg = (baseBearingDeg + sectorStep * 45) % 360;
-  const bearingAngle = bearingDeg * (Math.PI / 180);
-  const centerLat = originLat + radiusKm * Math.cos(bearingAngle) * latPerKm;
-  const centerLng = originLng + radiusKm * Math.sin(bearingAngle) * lngPerKm;
+  const bearingAngle = (bearingDeg * Math.PI) / 180;
+  const centerLat =
+    originLat + circleRadiusKm * Math.cos(bearingAngle) * latPerKm;
+  const centerLng =
+    originLng + circleRadiusKm * Math.sin(bearingAngle) * lngPerKm;
 
-  // 4 anchors for Walk Drift (serendipitous square/pentagon), 3 for Run Flow
+  // 4 anchors for Walk Drift (serendipitous pentagon), 3 for Run Flow
   const anchorFractions =
     activityMode === 'walk' ? [0.22, 0.48, 0.74, 0.9] : [0.25, 0.5, 0.75];
 
@@ -128,9 +256,9 @@ function buildLoopAnchors(
     const theta = bearingAngle + Math.PI + progress * 2 * Math.PI;
     const harmonic =
       activityMode === 'walk'
-        ? 1 + 0.1 * Math.sin(idx * 2.1 + seed)
+        ? 1 + 0.07 * Math.sin(idx * 2.1 + seed)
         : 1 + 0.04 * Math.cos(idx * 1.7 + seed);
-    const r = radiusKm * harmonic;
+    const r = circleRadiusKm * harmonic;
     const lat = centerLat + r * Math.cos(theta) * latPerKm;
     const lng = centerLng + r * Math.sin(theta) * lngPerKm;
     return [Number(lat.toFixed(6)), Number(lng.toFixed(6))];
@@ -138,70 +266,133 @@ function buildLoopAnchors(
 }
 
 /**
- * Generates 2 or 3 intermediate micro-POI corridor waypoints between `origin` and `destination`
- * for serendipitous Point A -> Point B discovery.
+ * Convenience wrapper for initial loop anchor generation using `targetDistanceKm / 2.75`.
+ */
+function buildLoopAnchors(
+  origin,
+  targetKm,
+  activityMode,
+  seed,
+  exploredSectors = [],
+  sectorStep = 0,
+  bearingOffsetDeg = null
+) {
+  const bearingDeg = resolveLoopBearingDeg(
+    seed,
+    exploredSectors,
+    sectorStep,
+    bearingOffsetDeg
+  );
+  const initialRadiusKm = Math.max(0.14, targetKm / 2.75);
+  return buildLoopAnchorsForRadius(
+    origin,
+    initialRadiusKm,
+    bearingDeg,
+    activityMode,
+    seed
+  );
+}
+
+/**
+ * Generates 2 or 3 intermediate corridor waypoints between `origin` and `destination`
+ * using metric-accurate perpendicular offsets (`detourAmplitudeKm`) so iterative
+ * Point A -> B duration calibration scales predictably in kilometers.
  */
 function buildCorridorAnchors(
   origin,
   destination,
   activityMode,
   seed,
-  corridorStyle = 'primary'
+  corridorStyle = 'primary',
+  detourAmplitudeKm = null
 ) {
   const [lat1, lng1] = origin;
   const [lat2, lng2] = destination;
-  const directKm = haversineKm(origin, destination);
+  const midLat = (lat1 + lat2) / 2;
+  const cosLat = Math.max(0.2, Math.cos((midLat * Math.PI) / 180));
+  const latPerKm = 1 / 111.32;
+  const lngPerKm = 1 / (111.32 * cosLat);
 
-  const dLat = lat2 - lat1;
-  const dLng = lng2 - lng1;
-  // Perpendicular vector for gentle side-street drift
-  const perpLat = -dLng;
-  const perpLng = dLat;
+  // Local metric vector (east = x, north = y) in km
+  const dxKm = (lng2 - lng1) * 111.32 * cosLat;
+  const dyKm = (lat2 - lat1) * 111.32;
+  const directKm = Math.hypot(dxKm, dyKm);
+
+  // Unit perpendicular vector in km
+  let perpX = 0;
+  let perpY = 1;
+  if (directKm >= 0.02) {
+    perpX = -dyKm / directKm;
+    perpY = dxKm / directKm;
+  } else {
+    const fallbackAngle = ((seed * 53) % 360) * (Math.PI / 180);
+    perpX = Math.cos(fallbackAngle);
+    perpY = Math.sin(fallbackAngle);
+  }
 
   const baseSign = seed % 2 === 0 ? 1 : -1;
-  const sideSign = corridorStyle === 'opposite' ? -baseSign : baseSign;
-  const baseLateral = activityMode === 'walk' ? 0.14 : 0.07;
-  const lateralScale =
-    corridorStyle === 'wide'
-      ? baseLateral * 1.65
-      : corridorStyle === 'opposite'
-      ? baseLateral * 1.15
-      : baseLateral;
+  const isLeftFlank =
+    corridorStyle === 'left_flank' || corridorStyle === 'opposite';
+  const isRightFlank =
+    corridorStyle === 'right_flank' || corridorStyle === 'wide';
 
-  if (directKm < 0.2) {
+  const sideSign = isLeftFlank ? -baseSign : baseSign;
+  const defaultAmplitudeKm = Math.max(
+    0.07,
+    directKm * (activityMode === 'walk' ? 0.14 : 0.08)
+  );
+  const amplitudeKm = Math.max(
+    0.03,
+    typeof detourAmplitudeKm === 'number' && Number.isFinite(detourAmplitudeKm)
+      ? detourAmplitudeKm
+      : defaultAmplitudeKm
+  );
+
+  const offsetPoint = (t, lateralMult, sign = sideSign) => {
+    const baseLat = lat1 + (lat2 - lat1) * t;
+    const baseLng = lng1 + (lng2 - lng1) * t;
+    const offsetKm = amplitudeKm * lateralMult * sign;
     return [
-      [
-        Number(((lat1 + lat2) / 2 + perpLat * lateralScale * sideSign).toFixed(6)),
-        Number(((lng1 + lng2) / 2 + perpLng * lateralScale * sideSign).toFixed(6)),
-      ],
+      Number((baseLat + perpY * offsetKm * latPerKm).toFixed(6)),
+      Number((baseLng + perpX * offsetKm * lngPerKm).toFixed(6)),
+    ];
+  };
+
+  if (directKm < 0.15 && amplitudeKm < 0.12) {
+    return [offsetPoint(0.5, 1.0, sideSign)];
+  }
+
+  if (activityMode === 'run') {
+    return [
+      offsetPoint(0.32, isRightFlank ? 1.05 : 0.92, sideSign),
+      offsetPoint(0.68, isLeftFlank ? 0.92 : 1.0, sideSign),
     ];
   }
 
-  const wp1 = [
-    Number((lat1 + dLat * 0.28 + perpLat * lateralScale * sideSign).toFixed(6)),
-    Number((lng1 + dLng * 0.28 + perpLng * lateralScale * sideSign).toFixed(6)),
-  ];
-
-  const midSign =
-    corridorStyle === 'wide'
-      ? sideSign
-      : ((seed + 1) % 2 === 0 ? -1 : 1) * sideSign;
-  const wp2 = [
-    Number((lat1 + dLat * 0.55 + perpLat * (lateralScale * 0.85) * midSign).toFixed(6)),
-    Number((lng1 + dLng * 0.55 + perpLng * (lateralScale * 0.85) * midSign).toFixed(6)),
-  ];
-
-  if (activityMode === 'run' || directKm < 0.9) {
-    return [wp1, wp2];
+  // Smooth single-sided arches for flanks & asymmetric drift for right_flank so
+  // all 3 corridors explore distinct parallel streets without zigzag backtracking
+  if (isLeftFlank) {
+    return [
+      offsetPoint(0.26, 0.85, sideSign),
+      offsetPoint(0.52, 1.02, sideSign),
+      offsetPoint(0.78, 0.82, sideSign),
+    ];
   }
 
-  const AlternatingSign = ((seed + 2) % 3 === 0 ? -1 : 1) * sideSign;
-  const wp3 = [
-    Number((lat1 + dLat * 0.8 + perpLat * (lateralScale * 0.85) * AlternatingSign).toFixed(6)),
-    Number((lng1 + dLng * 0.8 + perpLng * (lateralScale * 0.85) * AlternatingSign).toFixed(6)),
-  ];
+  if (isRightFlank) {
+    return [
+      offsetPoint(0.22, 0.95, sideSign),
+      offsetPoint(0.54, 1.08, sideSign),
+      offsetPoint(0.82, 0.76, sideSign),
+    ];
+  }
 
-  return [wp1, wp2, wp3];
+  // Primary corridor: gentle smooth bow
+  return [
+    offsetPoint(0.28, 0.82, sideSign),
+    offsetPoint(0.54, 1.0, sideSign),
+    offsetPoint(0.78, 0.8, sideSign),
+  ];
 }
 
 /**
@@ -222,13 +413,110 @@ function sortPOIsAlongCorridor(pois, origin, destination) {
 }
 
 /**
+ * Strictly filters POIs so every kept POI:
+ * 1. Lies within `maxVertexDistanceMeters` (250m) of one of the calibrated loop/corridor vertices.
+ * 2. Never sits near the start/end `origin` (or `destination` in Point A -> B mode).
+ * 3. Maps cleanly to at most one calibrated vertex slot (`matchedAnchorIndex`) to prevent clustering.
+ */
+function filterPOIsNearCalibratedVertices(
+  pois = [],
+  calibratedVertices = [],
+  {
+    origin = null,
+    destination = null,
+    maxVertexDistanceMeters = MAX_POI_VERTEX_DISTANCE_METERS,
+    minOriginDistanceMeters = 150,
+    minDestinationDistanceMeters = 120,
+  } = {}
+) {
+  if (!Array.isArray(pois) || pois.length === 0 || calibratedVertices.length === 0) {
+    return [];
+  }
+
+  const slotBest = new Map();
+
+  for (const poi of pois) {
+    if (!Array.isArray(poi?.coords) || poi.coords.length < 2) continue;
+
+    if (origin && minOriginDistanceMeters > 0) {
+      if (distanceMeters(origin, poi.coords) < minOriginDistanceMeters) {
+        continue;
+      }
+    }
+
+    if (destination && minDestinationDistanceMeters > 0) {
+      if (distanceMeters(destination, poi.coords) < minDestinationDistanceMeters) {
+        continue;
+      }
+    }
+
+    let nearestIdx = -1;
+    let nearestDist = Infinity;
+    for (let i = 0; i < calibratedVertices.length; i++) {
+      const d = distanceMeters(calibratedVertices[i], poi.coords);
+      if (d < nearestDist) {
+        nearestDist = d;
+        nearestIdx = i;
+      }
+    }
+
+    if (nearestIdx < 0 || nearestDist > maxVertexDistanceMeters) {
+      continue;
+    }
+
+    const enriched = {
+      ...poi,
+      matchedAnchorIndex: nearestIdx,
+      distFromAnchorMeters: Math.round(nearestDist),
+    };
+
+    const existing = slotBest.get(nearestIdx);
+    if (!existing || enriched.distFromAnchorMeters < existing.distFromAnchorMeters) {
+      slotBest.set(nearestIdx, enriched);
+    }
+  }
+
+  return Array.from(slotBest.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([, poi]) => poi);
+}
+
+/**
+ * Replaces calibrated anchor vertices with matched POIs in their exact loop/corridor slot order,
+ * preserving the original calibrated anchor whenever a vertex has no matched POI so the loop
+ * can never short-circuit or collapse.
+ */
+function mergePOIsIntoCalibratedAnchors(calibratedAnchors = [], matchedPOIs = []) {
+  const poiBySlot = new Map();
+  for (const poi of matchedPOIs) {
+    if (typeof poi.matchedAnchorIndex === 'number') {
+      poiBySlot.set(poi.matchedAnchorIndex, poi);
+    }
+  }
+  return calibratedAnchors.map((anchorCoord, idx) =>
+    poiBySlot.has(idx) ? poiBySlot.get(idx).coords : anchorCoord
+  );
+}
+
+/**
+ * Converts a Mapbox GeoJSON LineString `[lng, lat]` array to Leaflet `[lat, lng]` coordinates.
+ */
+function geoJsonToLatLngs(geoCoords = []) {
+  return geoCoords.map(([lng, lat]) => [
+    Number(lat.toFixed(6)),
+    Number(lng.toFixed(6)),
+  ]);
+}
+
+/**
  * Deterministic fallback route generator if offline or Mapbox request fails.
  */
 export function generateFallbackRoute({
   origin = [48.8638, 2.3615],
   destination = null,
   routeType = 'loop',
-  steps = 6000,
+  steps = minutesToSteps(30, 'walk'),
+  targetMinutes = null,
   activityMode = 'walk',
   stopVibe = 'all',
   planMode = 'instant',
@@ -243,8 +531,7 @@ export function generateFallbackRoute({
   visitedPoiIds = null,
   exploredSectors = null,
 }) {
-  const spec =
-    ROUTE_VARIANT_SPECS[variantIndex] || ROUTE_VARIANT_SPECS[0];
+  const spec = ROUTE_VARIANT_SPECS[variantIndex] || ROUTE_VARIANT_SPECS[0];
   const resolvedLabel = variantLabel || spec.variantLabel;
   const resolvedBadge = variantBadge || spec.variantBadge;
   const resolvedCorridorStyle = corridorStyle || spec.corridorStyle;
@@ -256,10 +543,39 @@ export function generateFallbackRoute({
       ? { visitedPoiNames, visitedPoiIds: visitedPoiIds || [], exploredSectors }
       : loadDriftHistory();
 
+  const pace = getPaceConfig(activityMode);
+  const baseTargetMinutes =
+    typeof targetMinutes === 'number' && targetMinutes > 0
+      ? targetMinutes
+      : stepsToMinutes(steps, activityMode);
+  const variantScale = spec.distanceScale ?? 1.0;
+  const targetVariantMinutes = baseTargetMinutes * variantScale;
+
   let waypoints = [];
-  let distanceKm = stepsToKm(steps);
+  let distanceKm = minutesToDistanceKm(targetVariantMinutes, activityMode);
+  let isDirectRoute = false;
+  let durationBadge = null;
 
   if (routeType === 'pointToPoint' && destination) {
+    const directStreetKm = Math.max(0.25, haversineKm(origin, destination) * 1.25);
+    const directMinsExact = distanceMetersToMinutesExact(
+      directStreetKm * 1000,
+      activityMode
+    );
+    const targetDistKm = (targetVariantMinutes * pace.metersPerMin) / 1000;
+
+    if (directMinsExact > baseTargetMinutes) {
+      isDirectRoute = true;
+      distanceKm = Number(directStreetKm.toFixed(2));
+    } else {
+      distanceKm = Number(Math.max(directStreetKm, targetDistKm).toFixed(2));
+    }
+
+    const extraKm = Math.max(0, distanceKm - directStreetKm);
+    const detourAmplitudeKm = isDirectRoute
+      ? Math.min(0.08, haversineKm(origin, destination) * 0.06)
+      : Math.max(0.08, extraKm / 2.6);
+
     const anchors =
       preloadedPOIs && preloadedPOIs.length > 0
         ? sortPOIsAlongCorridor(preloadedPOIs, origin, destination).map(
@@ -270,10 +586,10 @@ export function generateFallbackRoute({
             destination,
             activityMode,
             seed,
-            resolvedCorridorStyle
+            resolvedCorridorStyle,
+            detourAmplitudeKm
           );
     const controlPoints = [origin, ...anchors, destination];
-    // Interpolate smooth segments between control points
     for (let i = 0; i < controlPoints.length - 1; i++) {
       const [sLat, sLng] = controlPoints[i];
       const [eLat, eLng] = controlPoints[i + 1];
@@ -287,29 +603,24 @@ export function generateFallbackRoute({
       }
     }
     waypoints.push(destination);
-    const corridorFactor =
-      resolvedCorridorStyle === 'wide'
-        ? 1.44
-        : resolvedCorridorStyle === 'opposite'
-        ? 1.22
-        : 1.3;
-    distanceKm = Number(
-      Math.max(0.25, haversineKm(origin, destination) * corridorFactor).toFixed(2)
-    );
   } else {
     const [originLat, originLng] = origin;
-    const streetFactor = activityMode === 'walk' ? 1.32 : 1.18;
-    const radiusKm = Math.max(0.2, distanceKm / streetFactor / (2 * Math.PI));
+    const spanRadiusKm = Math.max(0.14, distanceKm / 2.75);
+    const circleRadiusKm = spanRadiusKm / 2;
     const latPerKm = 1 / 111.32;
-    const lngPerKm = 1 / (111.32 * Math.cos((originLat * Math.PI) / 180));
-    const baseBearingDeg = selectUnexploredBearingDeg(
+    const lngPerKm =
+      1 / (111.32 * Math.max(0.2, Math.cos((originLat * Math.PI) / 180)));
+    const bearingDeg = resolveLoopBearingDeg(
       seed,
-      history.exploredSectors
+      history.exploredSectors,
+      resolvedSectorStep,
+      spec.bearingOffsetDeg
     );
-    const bearingDeg = (baseBearingDeg + resolvedSectorStep * 45) % 360;
-    const bearingAngle = bearingDeg * (Math.PI / 180);
-    const centerLat = originLat + radiusKm * Math.cos(bearingAngle) * latPerKm;
-    const centerLng = originLng + radiusKm * Math.sin(bearingAngle) * lngPerKm;
+    const bearingAngle = (bearingDeg * Math.PI) / 180;
+    const centerLat =
+      originLat + circleRadiusKm * Math.cos(bearingAngle) * latPerKm;
+    const centerLng =
+      originLng + circleRadiusKm * Math.sin(bearingAngle) * lngPerKm;
 
     const numNodes = activityMode === 'walk' ? 28 : 20;
     for (let i = 0; i <= numNodes; i++) {
@@ -317,9 +628,15 @@ export function generateFallbackRoute({
       const theta = bearingAngle + Math.PI + progress * 2 * Math.PI;
       const harmonic =
         activityMode === 'walk'
-          ? 1 + 0.12 * Math.sin(progress * Math.PI * 6 + seed) * Math.sin(progress * Math.PI)
-          : 1 + 0.04 * Math.cos(progress * Math.PI * 4 + seed) * Math.sin(progress * Math.PI);
-      const r = radiusKm * harmonic;
+          ? 1 +
+            0.09 *
+              Math.sin(progress * Math.PI * 6 + seed) *
+              Math.sin(progress * Math.PI)
+          : 1 +
+            0.04 *
+              Math.cos(progress * Math.PI * 4 + seed) *
+              Math.sin(progress * Math.PI);
+      const r = circleRadiusKm * harmonic;
       waypoints.push([
         Number((centerLat + r * Math.cos(theta) * latPerKm).toFixed(6)),
         Number((centerLng + r * Math.sin(theta) * lngPerKm).toFixed(6)),
@@ -329,9 +646,15 @@ export function generateFallbackRoute({
     waypoints[waypoints.length - 1] = origin;
   }
 
-  const effectiveSteps = routeType === 'pointToPoint' ? kmToSteps(distanceKm) : steps;
-  const paceMinPerKm = activityMode === 'walk' ? 11.5 : 5.6;
-  const estimatedMinutes = Math.max(3, Math.round(distanceKm * paceMinPerKm));
+  const estimatedMinutes = distanceMetersToMinutes(
+    distanceKm * 1000,
+    activityMode
+  );
+  if (isDirectRoute) {
+    durationBadge = `Direct route • ${estimatedMinutes} min`;
+  }
+  const effectiveSteps = kmToSteps(distanceKm, activityMode);
+
   const pois =
     preloadedPOIs && preloadedPOIs.length > 0
       ? preloadedPOIs.map((poi) => ({
@@ -340,6 +663,7 @@ export function generateFallbackRoute({
         }))
       : getPOIsForRoute(waypoints, activityMode, seed, {
           stopVibe,
+          variantKey: spec.variantKey,
           visitedPoiNames: history.visitedPoiNames,
           visitedPoiIds: history.visitedPoiIds,
         });
@@ -361,16 +685,26 @@ export function generateFallbackRoute({
     destination: routeType === 'pointToPoint' ? destination : null,
     waypoints,
     steps: effectiveSteps,
+    targetSteps: steps,
+    targetMinutes: baseTargetMinutes,
     distanceKm,
     estimatedMinutes,
+    isDirectRoute,
+    durationBadge,
     activityMode,
     stopVibe,
     planMode,
     isStreetSnapped: false,
     metrics: {
       lowTrafficPct: quietScore,
-      elevationGainMeters: Math.max(4, Math.round(distanceKm * (activityMode === 'run' ? 2.2 : 4.5))),
-      trafficLightsAvoided: Math.max(2, Math.round(distanceKm * (activityMode === 'run' ? 3.4 : 2.1))),
+      elevationGainMeters: Math.max(
+        4,
+        Math.round(distanceKm * (activityMode === 'run' ? 2.2 : 4.5))
+      ),
+      trafficLightsAvoided: Math.max(
+        2,
+        Math.round(distanceKm * (activityMode === 'run' ? 3.4 : 2.1))
+      ),
       serendipityScore: activityMode === 'walk' ? 96 : 84,
     },
     pois,
@@ -378,16 +712,19 @@ export function generateFallbackRoute({
 }
 
 /**
- * Asynchronous street-accurate urban route generator powered by Mapbox Search Box + Walking Directions APIs.
- * 1. Discovers real-world micro-POIs along the target loop or Point A -> B corridor first.
- * 2. Filters out previously visited POIs & explored sectors so every Spin yields fresh discoveries.
- * 3. Snaps the pedestrian route through those real POI coordinates so the dotted path passes right in front of them.
+ * Asynchronous street-accurate urban route generator powered by Mapbox Walking Directions + Search Box APIs.
+ * 1. Calibrates loop radius (up to 3 damped refinement passes) or Point A -> B detour amplitude (up to 2 passes)
+ *    against Mapbox Directions distance evaluated with unified pace constants (80 m/min walk, 160 m/min run).
+ * 2. Discovers real-world POIs strictly within 250m of the already-calibrated vertices (never near origin).
+ * 3. Inserts matched POIs into the calibrated waypoint slots and re-verifies duration stays within tolerance
+ *    (dropping outlier POIs or keeping the calibrated loop if POIs distort duration beyond ±15%).
  */
 export async function generateUrbanRoute({
   origin = [48.8638, 2.3615],
   destination = null,
   routeType = 'loop', // 'loop' | 'pointToPoint'
-  steps = 6000,
+  steps = minutesToSteps(30, 'walk'),
+  targetMinutes = null,
   activityMode = 'walk',
   stopVibe = 'all',
   planMode = 'instant',
@@ -400,10 +737,11 @@ export async function generateUrbanRoute({
   visitedPoiNames = null,
   visitedPoiIds = null,
   exploredSectors = null,
+  mapboxToken = null,
   signal,
 }) {
-  const spec =
-    ROUTE_VARIANT_SPECS[variantIndex] || ROUTE_VARIANT_SPECS[0];
+  const activeToken = (mapboxToken || MAPBOX_TOKEN || '').trim();
+  const spec = ROUTE_VARIANT_SPECS[variantIndex] || ROUTE_VARIANT_SPECS[0];
   const resolvedLabel = variantLabel || spec.variantLabel;
   const resolvedBadge = variantBadge || spec.variantBadge;
   const resolvedCorridorStyle = corridorStyle || spec.corridorStyle;
@@ -415,12 +753,13 @@ export async function generateUrbanRoute({
       ? { visitedPoiNames, visitedPoiIds: visitedPoiIds || [], exploredSectors }
       : loadDriftHistory();
 
-  if (!MAPBOX_TOKEN) {
+  if (!activeToken) {
     return generateFallbackRoute({
       origin,
       destination,
       routeType,
       steps,
+      targetMinutes,
       activityMode,
       stopVibe,
       planMode,
@@ -439,98 +778,456 @@ export async function generateUrbanRoute({
   let discoveredPOIs = [];
 
   try {
-    let targetAnchors = [];
+    const pace = getPaceConfig(activityMode);
+    const baseTargetMinutes =
+      typeof targetMinutes === 'number' && targetMinutes > 0
+        ? targetMinutes
+        : stepsToMinutes(steps, activityMode);
+    const targetDistanceKm = (baseTargetMinutes * pace.metersPerMin) / 1000;
+    const variantScale = spec.distanceScale ?? 1.0;
+    const targetVariantMinutes = baseTargetMinutes * variantScale;
+
+    const fetchDirectionsForNodes = async (nodes) => {
+      const coordsQuery = nodes
+        .map(([lat, lng]) => `${lng.toFixed(6)},${lat.toFixed(6)}`)
+        .join(';');
+      const url = `https://api.mapbox.com/directions/v5/mapbox/walking/${coordsQuery}?geometries=geojson&overview=full&steps=false&access_token=${activeToken}`;
+      const res = await fetch(url, { signal });
+      if (!res.ok) {
+        throw new Error(`Mapbox Directions HTTP ${res.status}`);
+      }
+      const json = await res.json();
+      return json?.routes?.[0] || null;
+    };
+
+    const computeRouteMinutes = (mapboxRoute) =>
+      distanceMetersToMinutesExact(mapboxRoute?.distance || 0, activityMode);
+
+    const pickClosestCandidate = (candidates, goalMinutes, budgetMinutes) => {
+      if (!candidates.length) return null;
+      const withinBudget = candidates.filter(
+        (c) =>
+          Math.abs(c.actualMinutes - budgetMinutes) / budgetMinutes <=
+          LOOP_CALIBRATION_TOLERANCE
+      );
+      const pool = withinBudget.length > 0 ? withinBudget : candidates;
+      return pool.reduce((best, curr) => {
+        const bestErr = Math.abs(best.actualMinutes - goalMinutes);
+        const currErr = Math.abs(curr.actualMinutes - goalMinutes);
+        return currErr < bestErr ? curr : best;
+      });
+    };
+
+    let calibratedRoute = null;
+    let calibratedAnchors = [];
+    let isDirectRoute = false;
+    let durationBadge = null;
+    let minOriginDistanceMeters = 150;
+    let minDestinationDistanceMeters = 0;
+    let poiGoalMinutes = targetVariantMinutes;
+    let poiBudgetMinutes = baseTargetMinutes;
 
     if (routeType === 'pointToPoint' && destination) {
-      targetAnchors = buildCorridorAnchors(
-        origin,
-        destination,
-        activityMode,
-        seed,
-        resolvedCorridorStyle
+      // Point A -> B Mode: first evaluate true direct street distance between A and B
+      const directRoute = await fetchDirectionsForNodes([origin, destination]);
+      if (!directRoute?.geometry?.coordinates || directRoute.geometry.coordinates.length < 2) {
+        throw new Error('No direct street geometry returned from Mapbox Directions');
+      }
+
+      const directMinutesExact = computeRouteMinutes(directRoute);
+      const directStreetKm = (directRoute.distance || 0) / 1000;
+      const directHaversineKm = haversineKm(origin, destination);
+      minOriginDistanceMeters = Math.max(
+        100,
+        Math.min(200, Math.round(directHaversineKm * 180))
       );
+      minDestinationDistanceMeters = minOriginDistanceMeters;
+
+      if (directMinutesExact > baseTargetMinutes) {
+        // A and B are naturally further apart than the requested budget -> Direct route badge
+        isDirectRoute = true;
+        calibratedRoute = directRoute;
+        poiGoalMinutes = directMinutesExact;
+        poiBudgetMinutes = directMinutesExact;
+
+        // Keep secondary variants subtly distinct on parallel streets without bloating duration
+        if (resolvedCorridorStyle !== 'primary') {
+          const gentleAmplitudeKm = Math.max(
+            0.05,
+            Math.min(0.14, directHaversineKm * 0.08)
+          );
+          const gentleAnchors = buildCorridorAnchors(
+            origin,
+            destination,
+            activityMode,
+            seed,
+            resolvedCorridorStyle,
+            gentleAmplitudeKm
+          );
+          const gentleRoute = await fetchDirectionsForNodes([
+            origin,
+            ...gentleAnchors,
+            destination,
+          ]);
+          const gentleMins = computeRouteMinutes(gentleRoute);
+          if (
+            gentleRoute?.geometry?.coordinates?.length >= 2 &&
+            gentleMins <= directMinutesExact * 1.1
+          ) {
+            calibratedRoute = gentleRoute;
+            calibratedAnchors = gentleAnchors;
+          }
+        }
+
+        if (calibratedAnchors.length === 0) {
+          // Sample 3 interior vertices along the direct polyline for nearby POI discovery
+          const directLatLngs = geoJsonToLatLngs(calibratedRoute.geometry.coordinates);
+          const fracs = activityMode === 'walk' ? [0.25, 0.5, 0.75] : [0.3, 0.65];
+          calibratedAnchors = fracs.map(
+            (f) =>
+              directLatLngs[
+                Math.min(
+                  directLatLngs.length - 1,
+                  Math.max(1, Math.floor(directLatLngs.length * f))
+                )
+              ]
+          );
+        }
+      } else {
+        // Direct distance is shorter than targetMinutes -> iteratively calibrate lateral detour (up to 2 passes)
+        const corridorTargetMinutes = Math.max(
+          directMinutesExact,
+          targetVariantMinutes
+        );
+        const corridorTargetDistKm =
+          (corridorTargetMinutes * pace.metersPerMin) / 1000;
+        const extraKmNeeded = Math.max(0, corridorTargetDistKm - directStreetKm);
+
+        let detourAmplitudeKm =
+          extraKmNeeded < 0.12
+            ? Math.max(0.06, Math.min(0.16, directHaversineKm * 0.12))
+            : Math.max(
+                0.08,
+                Math.min(corridorTargetDistKm * 0.45, extraKmNeeded / 2.6)
+              );
+
+        const candidates = [
+          {
+            route: directRoute,
+            anchors: [],
+            actualMinutes: directMinutesExact,
+            detourAmplitudeKm: 0,
+          },
+        ];
+
+        const MAX_CORRIDOR_REFINEMENTS = 2;
+        for (let pass = 0; pass <= MAX_CORRIDOR_REFINEMENTS; pass++) {
+          const anchors = buildCorridorAnchors(
+            origin,
+            destination,
+            activityMode,
+            seed,
+            resolvedCorridorStyle,
+            detourAmplitudeKm
+          );
+          const candidateRoute = await fetchDirectionsForNodes([
+            origin,
+            ...anchors,
+            destination,
+          ]);
+          if (
+            !candidateRoute?.geometry?.coordinates ||
+            candidateRoute.geometry.coordinates.length < 2
+          ) {
+            break;
+          }
+
+          const actualMinutes = computeRouteMinutes(candidateRoute);
+          candidates.push({
+            route: candidateRoute,
+            anchors,
+            actualMinutes,
+            detourAmplitudeKm,
+          });
+
+          if (actualMinutes <= 0) break;
+          const ratio = corridorTargetMinutes / actualMinutes;
+          const offVariant = Math.abs(1 - ratio) > LOOP_CALIBRATION_TOLERANCE;
+          const offBudget =
+            Math.abs(actualMinutes - baseTargetMinutes) / baseTargetMinutes >
+            LOOP_CALIBRATION_TOLERANCE;
+
+          if (!offVariant && !offBudget) {
+            break;
+          }
+
+          if (pass < MAX_CORRIDOR_REFINEMENTS) {
+            const actualDistKm = (candidateRoute.distance || 0) / 1000;
+            const desiredExtraKm = Math.max(
+              0.04,
+              corridorTargetDistKm - directStreetKm
+            );
+            const currentExtraKm = Math.max(
+              0.04,
+              actualDistKm - directStreetKm
+            );
+            const extraRatio = Math.max(
+              0.25,
+              Math.min(3.0, desiredExtraKm / currentExtraKm)
+            );
+            detourAmplitudeKm = Math.max(
+              0.04,
+              Math.min(
+                corridorTargetDistKm * 0.55,
+                detourAmplitudeKm * Math.pow(extraRatio, 0.85)
+              )
+            );
+          }
+        }
+
+        const bestCorridor = pickClosestCandidate(
+          candidates,
+          corridorTargetMinutes,
+          baseTargetMinutes
+        );
+        calibratedRoute = bestCorridor.route;
+        calibratedAnchors =
+          bestCorridor.anchors.length > 0
+            ? bestCorridor.anchors
+            : buildCorridorAnchors(
+                origin,
+                destination,
+                activityMode,
+                seed,
+                resolvedCorridorStyle,
+                Math.max(0.06, directHaversineKm * 0.1)
+              );
+        poiGoalMinutes = corridorTargetMinutes;
+        poiBudgetMinutes = baseTargetMinutes;
+      }
     } else {
-      const targetKm = stepsToKm(steps);
-      targetAnchors = buildLoopAnchors(
-        origin,
-        targetKm,
-        activityMode,
+      // Loop Mode: Iterative Multi-Pass Radial Calibration (initial pass + up to 3 refinement iterations)
+      const bearingDeg = resolveLoopBearingDeg(
         seed,
         history.exploredSectors,
-        resolvedSectorStep
+        resolvedSectorStep,
+        spec.bearingOffsetDeg
+      );
+
+      let radiusKm = Math.max(0.14, (targetDistanceKm * variantScale) / 2.75);
+      const candidates = [];
+      const MAX_REFINEMENT_ITERATIONS = 3;
+
+      for (let iteration = 0; iteration <= MAX_REFINEMENT_ITERATIONS; iteration++) {
+        const anchors = buildLoopAnchorsForRadius(
+          origin,
+          radiusKm,
+          bearingDeg,
+          activityMode,
+          seed
+        );
+        const candidateRoute = await fetchDirectionsForNodes([
+          origin,
+          ...anchors,
+          origin,
+        ]);
+
+        if (
+          !candidateRoute?.geometry?.coordinates ||
+          candidateRoute.geometry.coordinates.length < 2
+        ) {
+          if (candidates.length === 0) {
+            throw new Error('No street geometry returned from Mapbox Directions');
+          }
+          break;
+        }
+
+        const actualMinutes = computeRouteMinutes(candidateRoute);
+        candidates.push({
+          route: candidateRoute,
+          anchors,
+          radiusKm,
+          actualMinutes,
+          iteration,
+        });
+
+        if (actualMinutes <= 0) break;
+
+        const ratio = targetVariantMinutes / actualMinutes;
+        const offVariant = Math.abs(1 - ratio) > LOOP_CALIBRATION_TOLERANCE;
+        const offBaseBudget =
+          Math.abs(actualMinutes - baseTargetMinutes) / baseTargetMinutes > 0.1;
+
+        if (!offVariant && !offBaseBudget) {
+          break;
+        }
+
+        if (iteration < MAX_REFINEMENT_ITERATIONS) {
+          const safeRatio = Math.max(0.25, Math.min(3.0, ratio));
+          // Damped proportional scaling to prevent overshooting across dense street grids
+          radiusKm = Math.max(
+            0.12,
+            Math.min(10, radiusKm * Math.pow(safeRatio, 0.85))
+          );
+        }
+      }
+
+      const bestLoop = pickClosestCandidate(
+        candidates,
+        targetVariantMinutes,
+        baseTargetMinutes
+      );
+      if (!bestLoop) {
+        throw new Error('No calibrated loop candidate produced');
+      }
+
+      calibratedRoute = bestLoop.route;
+      calibratedAnchors = bestLoop.anchors;
+      // Keep POIs clearly away from start/end origin (scales cleanly for short & long loops)
+      minOriginDistanceMeters = Math.max(
+        110,
+        Math.min(250, Math.round(bestLoop.radiusKm * 320))
       );
     }
 
-    // Step 1: Discover real neighborhood POIs around the target anchors/corridor
-    discoveredPOIs = await fetchRealPOIsAlongRoute(
-      targetAnchors,
+    // Step 2: Discover real POIs strictly within 250m of the ALREADY-CALIBRATED loop/corridor vertices
+    const rawPOIs = await fetchRealPOIsAlongRoute(
+      calibratedAnchors,
       activityMode,
-      MAPBOX_TOKEN,
+      activeToken,
       {
         seed,
         stopVibe,
+        variantKey: spec.variantKey,
         signal,
         visitedPoiNames: history.visitedPoiNames,
         visitedPoiIds: history.visitedPoiIds,
+        maxDistanceFromAnchorMeters: MAX_POI_VERTEX_DISTANCE_METERS,
+        origin,
+        destination: routeType === 'pointToPoint' ? destination : null,
+        minDistanceFromOriginMeters: minOriginDistanceMeters,
+        minDistanceFromDestinationMeters: minDestinationDistanceMeters,
+        allowFallback: false,
       }
     );
 
-    // Step 2: Build the Mapbox Walking Directions waypoint sequence passing directly by the real POIs
-    let routeNodes = [];
-    if (routeType === 'pointToPoint' && destination) {
-      const orderedPOIs =
-        discoveredPOIs.length > 0
-          ? sortPOIsAlongCorridor(discoveredPOIs, origin, destination)
-          : [];
-      const waypointCoords =
-        orderedPOIs.length > 0
-          ? orderedPOIs.map((poi) => poi.coords)
-          : targetAnchors;
-      routeNodes = [origin, ...waypointCoords, destination];
-      discoveredPOIs = orderedPOIs.length > 0 ? orderedPOIs : discoveredPOIs;
-    } else {
-      const waypointCoords =
-        discoveredPOIs.length > 0
-          ? discoveredPOIs.map((poi) => poi.coords)
-          : targetAnchors;
-      routeNodes = [origin, ...waypointCoords, origin];
+    let filteredPOIs = filterPOIsNearCalibratedVertices(rawPOIs, calibratedAnchors, {
+      origin,
+      destination: routeType === 'pointToPoint' ? destination : null,
+      maxVertexDistanceMeters: MAX_POI_VERTEX_DISTANCE_METERS,
+      minOriginDistanceMeters: minOriginDistanceMeters,
+      minDestinationDistanceMeters: minDestinationDistanceMeters,
+    });
+
+    if (routeType === 'pointToPoint' && destination && filteredPOIs.length > 1) {
+      filteredPOIs = sortPOIsAlongCorridor(filteredPOIs, origin, destination);
     }
 
-    // Mapbox Directions API expects `lng,lat;lng,lat;...`
-    const coordsQuery = routeNodes
-      .map(([lat, lng]) => `${lng.toFixed(6)},${lat.toFixed(6)}`)
-      .join(';');
+    // Step 3: Insert filtered POIs into the calibrated anchor slots & re-verify duration stays within tolerance
+    // (dropping outlier POIs if they distort duration beyond ±15%, or keeping the calibrated loop)
+    let primaryRoute = calibratedRoute;
+    const calibratedLatLngs = geoJsonToLatLngs(
+      calibratedRoute.geometry.coordinates
+    );
 
-    const url = `https://api.mapbox.com/directions/v5/mapbox/walking/${coordsQuery}?geometries=geojson&overview=full&steps=false&access_token=${MAPBOX_TOKEN}`;
+    const isPOIInsertionWithinTolerance = (candidateMinutes) => {
+      if (!Number.isFinite(candidateMinutes) || candidateMinutes <= 0) {
+        return false;
+      }
+      if (isDirectRoute) {
+        return candidateMinutes <= poiBudgetMinutes * 1.12;
+      }
+      const withinTargetBudget =
+        Math.abs(candidateMinutes - poiBudgetMinutes) / poiBudgetMinutes <=
+        LOOP_CALIBRATION_TOLERANCE;
+      const withinVariantWindow =
+        Math.abs(candidateMinutes - poiGoalMinutes) / poiGoalMinutes <=
+        POI_DURATION_TOLERANCE;
+      return withinTargetBudget && withinVariantWindow;
+    };
 
-    const response = await fetch(url, { signal });
-    if (!response.ok) {
-      throw new Error(`Mapbox Directions HTTP ${response.status}`);
+    if (filteredPOIs.length > 0) {
+      let activePOIs = [...filteredPOIs];
+      let acceptedPOIRoute = null;
+      const MAX_POI_PRUNE_ATTEMPTS = Math.min(3, activePOIs.length);
+
+      for (let attempt = 0; attempt < MAX_POI_PRUNE_ATTEMPTS; attempt++) {
+        if (activePOIs.length === 0) break;
+
+        const mergedWaypoints = mergePOIsIntoCalibratedAnchors(
+          calibratedAnchors,
+          activePOIs
+        );
+        const queryNodes =
+          routeType === 'pointToPoint' && destination
+            ? [origin, ...mergedWaypoints, destination]
+            : [origin, ...mergedWaypoints, origin];
+
+        const poiRoute = await fetchDirectionsForNodes(queryNodes);
+        const poiMinutes = computeRouteMinutes(poiRoute);
+
+        if (
+          poiRoute?.geometry?.coordinates?.length >= 2 &&
+          isPOIInsertionWithinTolerance(poiMinutes)
+        ) {
+          acceptedPOIRoute = poiRoute;
+          discoveredPOIs = activePOIs;
+          break;
+        }
+
+        // Drop the single biggest outlier POI (furthest from calibrated polyline / anchor vertex)
+        if (activePOIs.length <= 1) {
+          break;
+        }
+        let worstIdx = 0;
+        let worstScore = -1;
+        activePOIs.forEach((poi, idx) => {
+          const polyDist = distanceToPolylineMeters(poi.coords, calibratedLatLngs);
+          const score =
+            (Number.isFinite(polyDist) ? polyDist : 300) +
+            (poi.distFromAnchorMeters || 0);
+          if (score > worstScore) {
+            worstScore = score;
+            worstIdx = idx;
+          }
+        });
+        activePOIs = activePOIs.filter((_, idx) => idx !== worstIdx);
+      }
+
+      if (acceptedPOIRoute) {
+        primaryRoute = acceptedPOIRoute;
+      } else {
+        // Keep the cleanly calibrated loop/corridor geometry and retain only POIs right along the polyline
+        primaryRoute = calibratedRoute;
+        discoveredPOIs = filteredPOIs.filter(
+          (poi) =>
+            distanceToPolylineMeters(poi.coords, calibratedLatLngs) <=
+            MAX_POI_VERTEX_DISTANCE_METERS
+        );
+      }
     }
 
-    const data = await response.json();
-    const primaryRoute = data?.routes?.[0];
     const geoCoords = primaryRoute?.geometry?.coordinates;
-
     if (!geoCoords || geoCoords.length < 2) {
       throw new Error('No street geometry returned from Mapbox Directions');
     }
 
     // Convert GeoJSON [lng, lat] to Leaflet [lat, lng]
-    const waypoints = geoCoords.map(([lng, lat]) => [
-      Number(lat.toFixed(6)),
-      Number(lng.toFixed(6)),
-    ]);
+    const waypoints = geoJsonToLatLngs(geoCoords);
 
-    const realDistanceKm = Number((primaryRoute.distance / 1000).toFixed(2));
-    const calculatedSteps = kmToSteps(realDistanceKm);
+    const routeDistanceMeters = primaryRoute.distance || 0;
+    const realDistanceKm = Number((routeDistanceMeters / 1000).toFixed(2));
+    const calculatedSteps = kmToSteps(realDistanceKm, activityMode);
 
-    // Mapbox walking duration (seconds) adjusted if user selected Run Flow
-    const walkingMinutes = primaryRoute.duration / 60;
-    const estimatedMinutes = Math.max(
-      2,
-      Math.round(activityMode === 'run' ? walkingMinutes * 0.52 : walkingMinutes)
+    // Unified duration calculation: strictly derived from actual Mapbox distanceMeters / mode metersPerMin
+    const estimatedMinutes = distanceMetersToMinutes(
+      routeDistanceMeters,
+      activityMode
     );
+
+    if (isDirectRoute) {
+      durationBadge = `Direct route • ${estimatedMinutes} min`;
+    }
 
     // Recalculate exact detour distance from the street-snapped polyline to each real POI
     const pois = (
@@ -538,6 +1235,7 @@ export async function generateUrbanRoute({
         ? discoveredPOIs
         : getPOIsForRoute(waypoints, activityMode, seed, {
             stopVibe,
+            variantKey: spec.variantKey,
             visitedPoiNames: history.visitedPoiNames,
             visitedPoiIds: history.visitedPoiIds,
           })
@@ -564,8 +1262,11 @@ export async function generateUrbanRoute({
       waypoints,
       steps: calculatedSteps,
       targetSteps: steps,
+      targetMinutes: baseTargetMinutes,
       distanceKm: realDistanceKm,
       estimatedMinutes,
+      isDirectRoute,
+      durationBadge,
       activityMode,
       stopVibe,
       planMode,
@@ -591,6 +1292,7 @@ export async function generateUrbanRoute({
       destination,
       routeType,
       steps,
+      targetMinutes,
       activityMode,
       stopVibe,
       planMode,
@@ -609,7 +1311,7 @@ export async function generateUrbanRoute({
 }
 
 /**
- * Synchronously generates 3 distinct fallback route candidates (Curated Drift, Quiet Alleys, Scenic Arc)
+ * Synchronously generates 3 distinct fallback route candidates (Curated Drift, Quiet Alleys, Hidden Gems)
  * for immediate initial render or offline mode.
  */
 export function generateFallbackRouteAlternatives(params = {}) {
@@ -617,7 +1319,8 @@ export function generateFallbackRouteAlternatives(params = {}) {
     origin = [48.8638, 2.3615],
     destination = null,
     routeType = 'loop',
-    steps = 6000,
+    steps = minutesToSteps(30, 'walk'),
+    targetMinutes = null,
     activityMode = 'walk',
     stopVibe = 'all',
     planMode = 'instant',
@@ -637,17 +1340,14 @@ export function generateFallbackRouteAlternatives(params = {}) {
   );
 
   return ROUTE_VARIANT_SPECS.map((spec) => {
-    const variantSteps =
-      routeType === 'loop'
-        ? Math.max(1500, Math.round((steps * spec.distanceScale) / 100) * 100)
-        : steps;
     const variantSeed = seed + spec.seedStep;
 
     const candidate = generateFallbackRoute({
       origin,
       destination,
       routeType,
-      steps: variantSteps,
+      steps,
+      targetMinutes,
       activityMode,
       stopVibe,
       planMode,
@@ -671,17 +1371,19 @@ export function generateFallbackRouteAlternatives(params = {}) {
 }
 
 /**
- * Generates 3 distinct urban route candidates simultaneously in parallel (`Promise.all`):
- * - Route 1 ("Curated Drift" — Primary): Balanced target loop or corridor
- * - Route 2 ("Quiet Alleys" — 98% Calm): Shifted compass sector / opposite side-street corridor
- * - Route 3 ("Scenic Arc" — Deep Explorer): Wider exploration arc (~20% longer) with fresh POIs
+ * Generates 3 distinct urban route candidates simultaneously in parallel (`Promise.all`),
+ * all strictly calibrated to the user's chosen duration/step budget (within ±12%):
+ * - Route 1 ("Curated Drift" — Balanced): Primary unexplored compass sector, balanced mix of lively side streets & curated stops
+ * - Route 2 ("Quiet Alleys" — Calm & Green): Rotated compass sector (+120° in Loop, left-flank corridor in Point A -> B) prioritizing parks & quiet lanes
+ * - Route 3 ("Hidden Gems" — Local Discovery): Opposite compass sector (+240° in Loop, right-flank corridor in Point A -> B) routed toward distinct culinary/cultural POIs
  */
 export async function generateRouteAlternatives(params = {}) {
   const {
     origin = [48.8638, 2.3615],
     destination = null,
     routeType = 'loop',
-    steps = 6000,
+    steps = minutesToSteps(30, 'walk'),
+    targetMinutes = null,
     activityMode = 'walk',
     stopVibe = 'all',
     planMode = 'instant',
@@ -689,15 +1391,18 @@ export async function generateRouteAlternatives(params = {}) {
     visitedPoiNames = null,
     visitedPoiIds = null,
     exploredSectors = null,
+    mapboxToken = null,
     signal,
   } = params;
+
+  const activeToken = (mapboxToken || MAPBOX_TOKEN || '').trim();
 
   const history =
     visitedPoiNames && exploredSectors
       ? { visitedPoiNames, visitedPoiIds: visitedPoiIds || [], exploredSectors }
       : loadDriftHistory();
 
-  if (!MAPBOX_TOKEN) {
+  if (!activeToken) {
     return generateFallbackRouteAlternatives({
       ...params,
       visitedPoiNames: history.visitedPoiNames,
@@ -708,17 +1413,14 @@ export async function generateRouteAlternatives(params = {}) {
 
   const results = await Promise.all(
     ROUTE_VARIANT_SPECS.map((spec) => {
-      const variantSteps =
-        routeType === 'loop'
-          ? Math.max(1500, Math.round((steps * spec.distanceScale) / 100) * 100)
-          : steps;
       const variantSeed = seed + spec.seedStep;
 
       return generateUrbanRoute({
         origin,
         destination,
         routeType,
-        steps: variantSteps,
+        steps,
+        targetMinutes,
         activityMode,
         stopVibe,
         planMode,
@@ -731,6 +1433,7 @@ export async function generateRouteAlternatives(params = {}) {
         visitedPoiNames: history.visitedPoiNames,
         visitedPoiIds: history.visitedPoiIds,
         exploredSectors: history.exploredSectors,
+        mapboxToken: activeToken,
         signal,
       });
     })

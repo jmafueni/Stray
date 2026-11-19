@@ -392,13 +392,13 @@ export function distanceMeters([lat1, lng1], [lat2, lng2]) {
 }
 
 /**
- * Calculates the shortest distance in meters from `coord` ([lat, lng])
+ * Calculates the unclamped shortest distance in meters from `coord` ([lat, lng])
  * to the nearest segment on a polyline of `waypoints`.
  */
-export function calculateDetourMeters(coord, waypoints = []) {
-  if (!coord || !waypoints || waypoints.length === 0) return 18;
+export function distanceToPolylineMeters(coord, waypoints = []) {
+  if (!coord || !waypoints || waypoints.length === 0) return Infinity;
   if (waypoints.length === 1) {
-    return Math.max(5, Math.round(distanceMeters(coord, waypoints[0])));
+    return distanceMeters(coord, waypoints[0]);
   }
 
   let minMeters = Infinity;
@@ -432,7 +432,18 @@ export function calculateDetourMeters(coord, waypoints = []) {
     }
   }
 
-  // Since routes snap through or right beside the POI, keep realistic sidewalk offset (6m–65m)
+  return minMeters;
+}
+
+/**
+ * Calculates the shortest distance in meters from `coord` ([lat, lng])
+ * to the nearest segment on a polyline of `waypoints` (clamped for UI display).
+ */
+export function calculateDetourMeters(coord, waypoints = []) {
+  if (!coord || !waypoints || waypoints.length === 0) return 18;
+  const minMeters = distanceToPolylineMeters(coord, waypoints);
+  if (!Number.isFinite(minMeters)) return 18;
+  // Since routes snap through or right beside the POI, keep realistic sidewalk offset (6m–120m)
   return Math.max(6, Math.min(120, Math.round(minMeters)));
 }
 
@@ -604,7 +615,8 @@ export function selectCategorySpecsForVibe(
   activityMode = 'walk',
   stopVibe = 'all',
   count = 4,
-  seed = 0
+  seed = 0,
+  variantKey = 'primary'
 ) {
   if (activityMode === 'run') {
     const runCat = POI_CATEGORIES.run;
@@ -614,6 +626,38 @@ export function selectCategorySpecsForVibe(
   const allWalk = POI_CATEGORIES.walk;
   const eatsSpecs = allWalk.filter((c) => c.vibeGroup === 'eats');
   const cultureSpecs = allWalk.filter((c) => c.vibeGroup === 'culture');
+
+  // When stopVibe is 'all', bias the POI character by route variant:
+  // - 'quiet' ("Quiet Alleys" / Calm & Green): prioritizes parks, pedestrian squares, bookstores & quiet cafés
+  // - 'hidden_gems' / 'scenic' ("Hidden Gems" / Local Discovery): prioritizes distinct culinary & cultural POIs
+  if (stopVibe === 'all' && variantKey === 'quiet') {
+    const calmGreenPool = [
+      allWalk.find((c) => c.type === 'park'),
+      allWalk.find((c) => c.type === 'bookstore'),
+      allWalk.find((c) => c.type === 'coffee'),
+      allWalk.find((c) => c.type === 'gallery'),
+      allWalk.find((c) => c.type === 'bakery'),
+    ].filter(Boolean);
+    return Array.from(
+      { length: count },
+      (_, idx) => calmGreenPool[(idx + seed) % calmGreenPool.length]
+    );
+  }
+
+  if (stopVibe === 'all' && (variantKey === 'hidden_gems' || variantKey === 'scenic')) {
+    const localDiscoveryPool = [
+      allWalk.find((c) => c.type === 'bistro'),
+      allWalk.find((c) => c.type === 'gallery'),
+      allWalk.find((c) => c.type === 'wine_bar'),
+      allWalk.find((c) => c.type === 'artisanal_kitchen'),
+      allWalk.find((c) => c.type === 'bookstore'),
+      allWalk.find((c) => c.type === 'cantina'),
+    ].filter(Boolean);
+    return Array.from(
+      { length: count },
+      (_, idx) => localDiscoveryPool[(idx + seed) % localDiscoveryPool.length]
+    );
+  }
 
   if (stopVibe === 'eats') {
     return Array.from(
@@ -634,7 +678,7 @@ export function selectCategorySpecsForVibe(
     );
   }
 
-  // 'all' ("All Gems"): interleave Niche Eats (Hidden Bistro, Local Table, Wine Bar) with Coffee & Culture
+  // 'all' ("All Gems" / "Curated Drift"): interleave Niche Eats (Hidden Bistro, Local Table, Wine Bar) with Coffee & Culture
   const balancedPool = [];
   for (let i = 0; i < count; i++) {
     if (i % 2 === 0) {
@@ -759,14 +803,17 @@ async function queryMapboxCategoryAroundPoint(
   anchorCoord,
   categorySpec,
   token,
-  signal
+  signal,
+  searchRadiusMeters = 380
 ) {
   const [lat, lng] = anchorCoord;
   const proximity = `${lng.toFixed(5)},${lat.toFixed(5)}`;
 
-  // Delta bounding box (~950m around anchor) to keep discoveries strictly nearby
-  const latDelta = 0.0085;
-  const lngDelta = 0.011;
+  // Tight metric bounding box around the calibrated vertex so Mapbox prioritizes immediately adjacent venues
+  const clampedRadius = Math.max(250, Math.min(1200, Number(searchRadiusMeters) || 380));
+  const latDelta = clampedRadius / 111320;
+  const lngDelta =
+    clampedRadius / (111320 * Math.max(0.2, Math.cos((lat * Math.PI) / 180)));
   const bbox = [
     (lng - lngDelta).toFixed(5),
     (lat - latDelta).toFixed(5),
@@ -812,23 +859,35 @@ async function queryMapboxCategoryAroundPoint(
 }
 
 /**
- * Fetches 3 to 4 distinct, authentic real-world POIs along the route's anchors/waypoints
+ * Fetches 3 to 4 distinct, authentic real-world POIs strictly along the route's calibrated anchors/waypoints
  * using the Mapbox Search Box API (`/search/searchbox/v1/category/{category}` or `/search/searchbox/v1/forward`).
  *
- * Gracefully falls back to curated local spots if the API returns zero results or hits a network limit.
+ * Enforces strict proximity (`maxDistanceFromAnchorMeters`, default 250m) to calibrated vertices and keeps
+ * POIs away from `origin` / `destination` so they never short-circuit or bloat the calibrated loop.
  */
 export async function fetchRealPOIsAlongRoute(
   waypoints = [],
   activityMode = 'walk',
-  token = (import.meta.env?.VITE_MAPBOX_TOKEN || '').trim(),
+  token = (
+    import.meta.env?.VITE_MAPBOX_TOKEN ||
+    (typeof process !== 'undefined' ? process.env?.VITE_MAPBOX_TOKEN : '') ||
+    ''
+  ).trim(),
   options = {}
 ) {
   const {
     seed = 0,
     stopVibe = 'all',
+    variantKey = 'primary',
     signal,
     visitedPoiNames = [],
     visitedPoiIds = [],
+    maxDistanceFromAnchorMeters = 250,
+    origin = null,
+    destination = null,
+    minDistanceFromOriginMeters = 0,
+    minDistanceFromDestinationMeters = 0,
+    allowFallback = true,
   } = options;
 
   if (!waypoints || waypoints.length === 0) {
@@ -836,8 +895,10 @@ export async function fetchRealPOIsAlongRoute(
   }
 
   if (!token) {
+    if (!allowFallback) return [];
     return getPOIsForRoute(waypoints, activityMode, seed, {
       stopVibe,
+      variantKey,
       visitedPoiNames,
       visitedPoiIds,
     });
@@ -870,117 +931,209 @@ export async function fetchRealPOIsAlongRoute(
     activityMode,
     stopVibe,
     probeCoords.length,
-    seed
+    seed,
+    variantKey
+  );
+  const backupSpecsForProbes = selectCategorySpecsForVibe(
+    activityMode,
+    stopVibe,
+    probeCoords.length,
+    seed + 3,
+    variantKey
   );
 
   const selectedSpecs = probeCoords.map((coord, idx) => ({
     coord,
     spec: specsForProbes[idx],
+    backupSpec: backupSpecsForProbes[idx],
     index: idx,
   }));
+
+  const searchRadiusMeters = Math.max(
+    320,
+    Math.min(950, Math.round(maxDistanceFromAnchorMeters * 1.45))
+  );
+
+  const pickBestFromFeatures = (features, anchorCoord, spec, idx, usedNames, discoveredPOIs) => {
+    if (!features || features.length === 0) return null;
+
+    const candidates = features
+      .map((feat) => {
+        const geoCoords = feat?.geometry?.coordinates;
+        if (!Array.isArray(geoCoords) || geoCoords.length < 2) return null;
+        const [lng, lat] = geoCoords;
+        const name = (feat?.properties?.name || feat?.text || '').trim();
+        if (!name || isGenericChain(name, feat)) return null;
+
+        const featId = String(feat?.properties?.mapbox_id || '');
+        const normName = name.toLowerCase();
+        const wasVisited =
+          visitedNameSet.has(normName) ||
+          (featId && visitedIdSet.has(featId));
+
+        const coords = [Number(lat.toFixed(6)), Number(lng.toFixed(6))];
+        const distFromAnchor = distanceMeters(anchorCoord, coords);
+        return {
+          feat,
+          featId,
+          name,
+          normName,
+          wasVisited,
+          coords,
+          distFromAnchor,
+        };
+      })
+      .filter(Boolean)
+      .filter((item) => item.distFromAnchor <= maxDistanceFromAnchorMeters)
+      .filter((item) => {
+        if (origin && minDistanceFromOriginMeters > 0) {
+          if (distanceMeters(origin, item.coords) < minDistanceFromOriginMeters) {
+            return false;
+          }
+        }
+        if (destination && minDistanceFromDestinationMeters > 0) {
+          if (distanceMeters(destination, item.coords) < minDistanceFromDestinationMeters) {
+            return false;
+          }
+        }
+        return true;
+      })
+      .sort((a, b) => a.distFromAnchor - b.distFromAnchor);
+
+    // Deduplicate against venues already picked in this route and ensure >60m spacing
+    const uniqueCandidates = candidates.filter((c) => {
+      if (usedNames.has(c.normName)) return false;
+      const tooClose = discoveredPOIs.some(
+        (existing) => distanceMeters(existing.coords, c.coords) < 60
+      );
+      return !tooClose;
+    });
+
+    if (uniqueCandidates.length === 0) return null;
+
+    // Strictly prefer unvisited venues unless no fresh alternatives exist
+    const freshCandidates = uniqueCandidates.filter((c) => !c.wasVisited);
+    const pool = freshCandidates.length > 0 ? freshCandidates : uniqueCandidates;
+
+    const pickIdx = seed % Math.min(3, pool.length);
+    const chosen = pool[pickIdx];
+    usedNames.add(chosen.normName);
+
+    const { streetName, address } = extractStreetAndAddress(chosen.feat);
+    const detourMeters = calculateDetourMeters(chosen.coords, waypoints);
+    const vibeScore = Math.min(
+      98,
+      Math.max(88, 91 + ((chosen.name.length + idx * 3 + seed) % 7))
+    );
+
+    const presentation = refineCulinaryPresentation(
+      chosen.name,
+      chosen.feat,
+      spec
+    );
+
+    return {
+      id:
+        chosen.featId ||
+        `poi-real-${activityMode}-${idx}-${Date.now()}`,
+      name: chosen.name,
+      address,
+      streetName,
+      category: presentation.label,
+      type: presentation.type,
+      icon: presentation.icon,
+      color: presentation.color,
+      coords: chosen.coords,
+      vibeScore,
+      detourMeters,
+      anchorIndex: idx,
+      distFromAnchorMeters: Math.round(chosen.distFromAnchor),
+      note: buildEditorialFieldNote(
+        streetName,
+        presentation.type,
+        activityMode,
+        idx
+      ),
+      isReal: true,
+      isFreshDiscovery: !chosen.wasVisited,
+    };
+  };
 
   try {
     const rawLists = await Promise.all(
       selectedSpecs.map(({ coord, spec }) =>
-        queryMapboxCategoryAroundPoint(coord, spec, token, signal)
+        queryMapboxCategoryAroundPoint(coord, spec, token, signal, searchRadiusMeters)
       )
     );
 
     const usedNames = new Set();
     const discoveredPOIs = [];
+    const missedIndices = [];
 
     rawLists.forEach((features, idx) => {
       const { coord: anchorCoord, spec } = selectedSpecs[idx];
-      if (!features || features.length === 0) return;
-
-      // Filter out generic chains, deduplicate by name, and ensure reasonable distance from anchor
-      const candidates = features
-        .map((feat) => {
-          const geoCoords = feat?.geometry?.coordinates;
-          if (!Array.isArray(geoCoords) || geoCoords.length < 2) return null;
-          const [lng, lat] = geoCoords;
-          const name = (feat?.properties?.name || feat?.text || '').trim();
-          if (!name || isGenericChain(name, feat)) return null;
-
-          const featId = String(feat?.properties?.mapbox_id || '');
-          const normName = name.toLowerCase();
-          const wasVisited =
-            visitedNameSet.has(normName) ||
-            (featId && visitedIdSet.has(featId));
-
-          const coords = [Number(lat.toFixed(6)), Number(lng.toFixed(6))];
-          const distFromAnchor = distanceMeters(anchorCoord, coords);
-          return {
-            feat,
-            featId,
-            name,
-            normName,
-            wasVisited,
-            coords,
-            distFromAnchor,
-          };
-        })
-        .filter(Boolean)
-        .filter((item) => item.distFromAnchor <= 1400)
-        .sort((a, b) => a.distFromAnchor - b.distFromAnchor);
-
-      // Deduplicate against venues already picked in this route and ensure >60m spacing
-      const uniqueCandidates = candidates.filter((c) => {
-        if (usedNames.has(c.normName)) return false;
-        const tooClose = discoveredPOIs.some(
-          (existing) => distanceMeters(existing.coords, c.coords) < 60
-        );
-        return !tooClose;
-      });
-
-      if (uniqueCandidates.length === 0) return;
-
-      // Strictly prefer unvisited venues unless no fresh alternatives exist
-      const freshCandidates = uniqueCandidates.filter((c) => !c.wasVisited);
-      const pool =
-        freshCandidates.length > 0 ? freshCandidates : uniqueCandidates;
-
-      const pickIdx = seed % Math.min(3, pool.length);
-      const chosen = pool[pickIdx];
-      usedNames.add(chosen.normName);
-
-      const { streetName, address } = extractStreetAndAddress(chosen.feat);
-      const detourMeters = calculateDetourMeters(chosen.coords, waypoints);
-      const vibeScore = Math.min(
-        98,
-        Math.max(88, 91 + ((chosen.name.length + idx * 3 + seed) % 7))
+      const poi = pickBestFromFeatures(
+        features,
+        anchorCoord,
+        spec,
+        idx,
+        usedNames,
+        discoveredPOIs
       );
-
-      const presentation = refineCulinaryPresentation(
-        chosen.name,
-        chosen.feat,
-        spec
-      );
-
-      discoveredPOIs.push({
-        id:
-          chosen.featId ||
-          `poi-real-${activityMode}-${idx}-${Date.now()}`,
-        name: chosen.name,
-        address,
-        streetName,
-        category: presentation.label,
-        type: presentation.type,
-        icon: presentation.icon,
-        color: presentation.color,
-        coords: chosen.coords,
-        vibeScore,
-        detourMeters,
-        note: buildEditorialFieldNote(
-          streetName,
-          presentation.type,
-          activityMode,
-          idx
-        ),
-        isReal: true,
-        isFreshDiscovery: !chosen.wasVisited,
-      });
+      if (poi) {
+        discoveredPOIs.push(poi);
+      } else {
+        missedIndices.push(idx);
+      }
     });
+
+    // If any vertex found 0 qualifying POIs within 250m for its primary category,
+    // try one backup category from the same vibe pool around those missed vertices.
+    if (missedIndices.length > 0) {
+      const backupLists = await Promise.all(
+        missedIndices.map((idx) => {
+          const { coord, spec, backupSpec } = selectedSpecs[idx];
+          const altSpec =
+            backupSpec && backupSpec.mapboxCategory !== spec.mapboxCategory
+              ? backupSpec
+              : activityMode === 'run'
+              ? POI_CATEGORIES.run[(idx + 1) % POI_CATEGORIES.run.length]
+              : POI_CATEGORIES.walk.find(
+                  (c) =>
+                    c.mapboxCategory !== spec.mapboxCategory &&
+                    (stopVibe === 'all' || c.vibeGroup === stopVibe)
+                ) || POI_CATEGORIES.walk[0];
+          return queryMapboxCategoryAroundPoint(
+            coord,
+            altSpec,
+            token,
+            signal,
+            searchRadiusMeters
+          ).then((features) => ({ idx, altSpec, features }));
+        })
+      );
+
+      backupLists.forEach(({ idx, altSpec, features }) => {
+        const { coord: anchorCoord } = selectedSpecs[idx];
+        const poi = pickBestFromFeatures(
+          features,
+          anchorCoord,
+          altSpec,
+          idx,
+          usedNames,
+          discoveredPOIs
+        );
+        if (poi) {
+          discoveredPOIs.push(poi);
+        }
+      });
+
+      discoveredPOIs.sort((a, b) => (a.anchorIndex ?? 0) - (b.anchorIndex ?? 0));
+    }
+
+    if (!allowFallback) {
+      return discoveredPOIs.slice(0, 4);
+    }
 
     if (discoveredPOIs.length >= 2) {
       return discoveredPOIs.slice(0, 4);
@@ -989,9 +1142,14 @@ export async function fetchRealPOIsAlongRoute(
     if (err?.name === 'AbortError') throw err;
   }
 
+  if (!allowFallback) {
+    return [];
+  }
+
   // Graceful fallback to curated local spots if API returns zero results or hits a network limit
   return getPOIsForRoute(waypoints, activityMode, seed, {
     stopVibe,
+    variantKey,
     visitedPoiNames,
     visitedPoiIds,
   });
@@ -1010,6 +1168,7 @@ export function getPOIsForRoute(
   if (!waypoints || waypoints.length === 0) return [];
 
   const stopVibe = options.stopVibe || 'all';
+  const variantKey = options.variantKey || 'primary';
   const visitedNameSet = new Set(
     (options.visitedPoiNames || []).map((n) => String(n).toLowerCase().trim())
   );
@@ -1020,7 +1179,8 @@ export function getPOIsForRoute(
     activityMode,
     stopVibe,
     sampleFractions.length,
-    seed
+    seed,
+    variantKey
   );
 
   return sampleFractions.map((frac, idx) => {

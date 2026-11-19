@@ -8,6 +8,7 @@ import {
   generateRouteAlternatives,
   generateFallbackRouteAlternatives,
   kmToSteps,
+  minutesToSteps,
 } from './utils/router';
 import { distanceMeters } from './utils/pois';
 import {
@@ -31,7 +32,7 @@ export default function App() {
   const [planMode, setPlanMode] = useState('instant'); // 'instant' | 'planner'
   const [activityMode, setActivityMode] = useState('walk'); // 'walk' | 'run'
   const [stopVibe, setStopVibe] = useState('all'); // 'all' | 'eats' | 'culture'
-  const [steps, setSteps] = useState(6000); // 6,000 steps ≈ 4.5 km
+  const [steps, setSteps] = useState(() => minutesToSteps(30, 'walk')); // 3,450 steps = 30 min / 2.40 km at 4.8 km/h
   const [scheduledTime, setScheduledTime] = useState('18:30');
   const [seed, setSeed] = useState(1);
   const [selectedPOI, setSelectedPOI] = useState(null);
@@ -58,7 +59,7 @@ export default function App() {
       origin: DEFAULT_COORDS,
       destination: DEFAULT_DESTINATION,
       routeType: 'loop',
-      steps: 6000,
+      steps: minutesToSteps(30, 'walk'),
       activityMode: 'walk',
       stopVibe: 'all',
       planMode: 'instant',
@@ -250,9 +251,9 @@ export default function App() {
         )
       );
 
-  const totalDistanceKm = route?.distanceKm || 4.5;
+  const totalDistanceKm = route?.distanceKm || 2.4;
   const coveredKm = Number(((totalDistanceKm * progressPct) / 100).toFixed(2));
-  const coveredSteps = kmToSteps(coveredKm);
+  const coveredSteps = kmToSteps(coveredKm, route?.activityMode || activityMode);
 
   const handleRegenerate = () => {
     setSelectedPOI(null);

@@ -200,11 +200,93 @@ function getRouteCalloutCoord(waypoints = [], variantIndex = 1) {
   return waypoints[idx];
 }
 
+/**
+ * Computes responsive Leaflet `fitBounds` padding options so the active route and
+ * all numbered POI markers frame cleanly in the unobstructed upper viewport above
+ * the floating bottom sheet (`ControlPanel` or compact `ActiveDriftHUD`).
+ */
+export function getRouteFitPadding(isDriftActive = false) {
+  const width = typeof window !== 'undefined' ? window.innerWidth : 1024;
+  const height = typeof window !== 'undefined' ? window.innerHeight : 768;
+
+  if (isDriftActive) {
+    return {
+      paddingTopLeft: [48, 88],
+      paddingBottomRight: [48, Math.min(240, Math.round(height * 0.28))],
+      maxZoom: 16,
+      animate: true,
+      duration: 0.65,
+    };
+  }
+
+  if (width < 640) {
+    return {
+      paddingTopLeft: [36, 84],
+      paddingBottomRight: [36, Math.min(440, Math.round(height * 0.54))],
+      maxZoom: 16,
+      animate: true,
+      duration: 0.65,
+    };
+  }
+
+  return {
+    paddingTopLeft: [64, 92],
+    paddingBottomRight: [64, Math.min(430, Math.round(height * 0.48))],
+    maxZoom: 16,
+    animate: true,
+    duration: 0.65,
+  };
+}
+
+function isValidLatLng(coord) {
+  return (
+    Array.isArray(coord) &&
+    coord.length >= 2 &&
+    Number.isFinite(coord[0]) &&
+    Number.isFinite(coord[1])
+  );
+}
+
+/**
+ * Collects all coordinates for the active route (waypoints + POI markers + start/finish anchors)
+ * so Leaflet `fitBounds` keeps the entire path and every numbered stop marker in view.
+ */
+function getActiveRouteBoundsPoints({
+  activeRoute,
+  origin,
+  destination,
+  routeType,
+}) {
+  const points = [];
+
+  if (Array.isArray(activeRoute?.waypoints)) {
+    for (const wp of activeRoute.waypoints) {
+      if (isValidLatLng(wp)) points.push(wp);
+    }
+  }
+
+  if (Array.isArray(activeRoute?.pois)) {
+    for (const poi of activeRoute.pois) {
+      if (isValidLatLng(poi?.coords)) points.push(poi.coords);
+    }
+  }
+
+  if (isValidLatLng(origin)) {
+    points.push(origin);
+  }
+
+  if (routeType === 'pointToPoint' && isValidLatLng(destination)) {
+    points.push(destination);
+  }
+
+  return points;
+}
+
 function MapViewportUpdater({
   origin,
   destination,
-  waypoints,
-  allRoutes,
+  routeType,
+  activeRoute,
   selectedPOI,
   markerRefs,
   isDrifting,
@@ -234,30 +316,27 @@ function MapViewportUpdater({
     };
   }, [map]);
 
-  // Fit bounds with asymmetric bottom padding so all route alternatives frame neatly above the floating ControlPanel
+  // Fit bounds with dynamic viewport-aware bottom padding so the active route and its POIs sit cleanly above the bottom sheet
   useEffect(() => {
     if (selectedPOI?.coords || isDrifting) return;
     map.invalidateSize({ animate: false });
 
-    const fitOptions = {
-      paddingTopLeft: [48, 72],
-      paddingBottomRight: [48, 360],
-      maxZoom: 16,
-    };
+    const fitOptions = getRouteFitPadding(isDrifting);
+    const boundsPoints = getActiveRouteBoundsPoints({
+      activeRoute,
+      origin,
+      destination,
+      routeType,
+    });
 
-    const combinedPoints =
-      Array.isArray(allRoutes) && allRoutes.length > 0
-        ? allRoutes.flatMap((r) => r?.waypoints || [])
-        : waypoints || [];
-
-    if (combinedPoints.length > 1) {
-      map.fitBounds(combinedPoints, fitOptions);
-    } else if (origin && destination) {
-      map.fitBounds([origin, destination], fitOptions);
-    } else if (origin) {
+    if (boundsPoints.length > 1) {
+      map.fitBounds(L.latLngBounds(boundsPoints), fitOptions);
+    } else if (routeType === 'pointToPoint' && isValidLatLng(origin) && isValidLatLng(destination)) {
+      map.fitBounds(L.latLngBounds([origin, destination]), fitOptions);
+    } else if (isValidLatLng(origin)) {
       map.setView(origin, 15);
     }
-  }, [map, origin, destination, waypoints, allRoutes, selectedPOI, isDrifting]);
+  }, [map, origin, destination, routeType, activeRoute, selectedPOI, isDrifting]);
 
   // Follow live user GPS beacon during Active Drift
   useEffect(() => {
@@ -332,6 +411,11 @@ export default function MapView({
       ? [route]
       : [];
   const activeRouteId = selectedRouteId || route?.id;
+  const activeRoute =
+    route ||
+    candidateRoutes.find((r) => r && r.id === activeRouteId) ||
+    candidateRoutes[0] ||
+    null;
   const secondaryRoutes = isDrifting
     ? []
     : candidateRoutes.filter((r) => r && r.id !== activeRouteId);
@@ -345,7 +429,7 @@ export default function MapView({
     : FALLBACK_PAPER_TILES;
 
   const loopColor =
-    route?.activityMode === 'run'
+    activeRoute?.activityMode === 'run'
       ? isDark
         ? '#34D399'
         : '#059669'
@@ -356,27 +440,28 @@ export default function MapView({
     if (!map) return;
     if (onSelectPOI) onSelectPOI(null);
     map.closePopup();
+    map.invalidateSize({ animate: false });
 
-    const fitOptions = {
-      paddingTopLeft: [48, 72],
-      paddingBottomRight: [48, 360],
-      maxZoom: 16,
-      animate: true,
-    };
+    const fitOptions = getRouteFitPadding(isDrifting);
+    const boundsPoints = getActiveRouteBoundsPoints({
+      activeRoute,
+      origin,
+      destination,
+      routeType,
+    });
 
-    const allWaypoints =
-      candidateRoutes.length > 0
-        ? candidateRoutes.flatMap((r) => r?.waypoints || [])
-        : route?.waypoints || [];
-
-    if (allWaypoints.length > 1) {
-      map.fitBounds(allWaypoints, fitOptions);
-    } else if (routeType === 'pointToPoint' && origin && destination) {
-      map.fitBounds([origin, destination], fitOptions);
-    } else if (origin) {
-      map.flyTo(origin, 15, { duration: 0.6 });
+    if (boundsPoints.length > 1) {
+      map.fitBounds(L.latLngBounds(boundsPoints), fitOptions);
+    } else if (
+      routeType === 'pointToPoint' &&
+      isValidLatLng(origin) &&
+      isValidLatLng(destination)
+    ) {
+      map.fitBounds(L.latLngBounds([origin, destination]), fitOptions);
+    } else if (isValidLatLng(origin)) {
+      map.flyTo(origin, 15, { duration: 0.65 });
     }
-  }, [candidateRoutes, route?.waypoints, routeType, origin, destination, onSelectPOI]);
+  }, [activeRoute, isDrifting, routeType, origin, destination, onSelectPOI]);
 
   const handleCenterOnMe = useCallback(() => {
     const map = mapInstanceRef.current;
@@ -435,8 +520,8 @@ export default function MapView({
         <MapViewportUpdater
           origin={origin}
           destination={destination}
-          waypoints={route?.waypoints}
-          allRoutes={candidateRoutes}
+          routeType={routeType}
+          activeRoute={activeRoute}
           selectedPOI={selectedPOI}
           markerRefs={markerRefs}
           isDrifting={isDrifting}

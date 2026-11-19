@@ -25,7 +25,12 @@ import {
   Utensils,
   Coffee,
 } from 'lucide-react';
-import { stepsToKm, geocodeDestination } from '../utils/router';
+import {
+  stepsToKm,
+  stepsToMinutes,
+  minutesToSteps,
+  geocodeDestination,
+} from '../utils/router';
 import { STOP_VIBE_MODES } from '../utils/pois';
 import { getCombinedHallOfFameRoutes } from '../utils/storage';
 import POICard from './POICard';
@@ -83,8 +88,10 @@ export default function ControlPanel({
   const [showDropdown, setShowDropdown] = useState(false);
 
   const isDark = theme === 'dark';
-  const displayDistanceKm = route?.distanceKm || stepsToKm(steps);
+  const displayDistanceKm = route?.distanceKm || stepsToKm(steps, activityMode);
   const displaySteps = route?.steps || steps;
+  const targetMinutes = stepsToMinutes(steps, activityMode);
+  const DURATION_PILLS = [15, 30, 45, 60];
 
   // Keep search input synchronized when user taps on the map to drop Point B
   useEffect(() => {
@@ -527,7 +534,7 @@ export default function ControlPanel({
         </div>
       )}
 
-      {/* 3. Editorial Distance / Step Panel (Slider in Loop mode, Real A->B Readout in Point-to-Point mode) */}
+      {/* 3. Editorial Time-Budget & Step Panel (Target Duration + Quick Pills + Step Slider in Loop mode, Real A->B Readout in Point-to-Point mode) */}
       <div
         className={`mt-3 p-3.5 rounded-2xl border ${
           isDark
@@ -535,7 +542,7 @@ export default function ControlPanel({
             : 'bg-[#FAF8F5] border-[#1C1C1E]/12 shadow-[0_2px_8px_rgba(28,28,30,0.03)]'
         }`}
       >
-        <div className="flex items-baseline justify-between mb-1.5">
+        <div className="flex items-start justify-between gap-2 mb-2">
           <div>
             <span
               className={`text-[10px] uppercase tracking-widest font-semibold flex items-center gap-1.5 ${
@@ -544,50 +551,94 @@ export default function ControlPanel({
             >
               {routeType === 'pointToPoint'
                 ? 'Street Corridor (Point A → B)'
-                : 'Target Loop Effort'}
+                : 'Target Time & Step Budget'}
               {isRouting && (
                 <span className="inline-flex items-center gap-1 text-[#FF6B4A] font-bold">
                   <Loader2 className="w-3 h-3 animate-spin" /> routing...
                 </span>
               )}
             </span>
-            <div className="flex items-baseline gap-2">
+            <div className="flex items-baseline gap-2 flex-wrap mt-0.5">
               <span className="font-editorial text-xl font-bold tracking-tight">
-                {displaySteps.toLocaleString()}{' '}
-                <span
-                  className={`font-sans text-xs font-normal ${
-                    isDark ? 'text-stone-400' : 'text-stone-500'
-                  }`}
-                >
-                  steps
-                </span>
+                {routeType === 'loop'
+                  ? `${targetMinutes} min`
+                  : `${route?.estimatedMinutes || targetMinutes} min`}
+              </span>
+              <span
+                className={`text-xs font-medium ${
+                  isDark ? 'text-stone-400' : 'text-stone-600'
+                }`}
+              >
+                ({(routeType === 'loop' ? steps : displaySteps).toLocaleString()} steps)
               </span>
               <span className="text-xs font-bold text-[#FF6B4A]">
-                ≈ {displayDistanceKm} km
+                • ≈ {displayDistanceKm} km
               </span>
             </div>
           </div>
 
-          <div className="text-right">
-            <span
-              className={`text-[10px] uppercase tracking-wider font-semibold block ${
-                isDark ? 'text-stone-400' : 'text-stone-500'
-              }`}
+          {routeType === 'loop' ? (
+            <div
+              role="group"
+              aria-label="Quick duration presets"
+              className="flex items-center gap-1 flex-shrink-0"
             >
-              Est. Duration
-            </span>
-            <span className="font-editorial text-sm font-bold">
-              ~{route?.estimatedMinutes || 35} min
-            </span>
-          </div>
+              {DURATION_PILLS.map((mins) => {
+                const pillSteps = minutesToSteps(mins, activityMode);
+                const isPillActive =
+                  Math.abs(targetMinutes - mins) <= 2 || steps === pillSteps;
+                return (
+                  <button
+                    key={mins}
+                    type="button"
+                    onClick={() => setSteps(pillSteps)}
+                    className={`px-2 py-1 rounded-lg text-[10px] font-bold transition-all ${
+                      isPillActive
+                        ? 'bg-[#FF6B4A] text-white shadow-sm shadow-[#FF6B4A]/30'
+                        : isDark
+                        ? 'bg-white/5 text-stone-300 hover:bg-white/10 border border-white/10'
+                        : 'bg-[#EAE5DB]/80 text-[#1C1C1E] hover:bg-[#EAE5DB] border border-[#1C1C1E]/10'
+                    }`}
+                  >
+                    {mins}m
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="text-right">
+              <span
+                className={`text-[10px] uppercase tracking-wider font-semibold block ${
+                  isDark ? 'text-stone-400' : 'text-stone-500'
+                }`}
+              >
+                {route?.isDirectRoute ? 'Budget Exceeded' : 'Active Route'}
+              </span>
+              {route?.durationBadge ? (
+                <span
+                  className={`inline-flex items-center gap-1 mt-0.5 text-[10px] font-bold px-2.5 py-0.5 rounded-full border ${
+                    isDark
+                      ? 'bg-amber-400/15 border-amber-400/35 text-amber-300'
+                      : 'bg-amber-500/15 border-amber-600/30 text-amber-900'
+                  }`}
+                >
+                  {route.durationBadge}
+                </span>
+              ) : (
+                <span className="font-editorial text-sm font-bold">
+                  {route?.estimatedMinutes || 30} min • {displayDistanceKm} km
+                </span>
+              )}
+            </div>
+          )}
         </div>
 
         {routeType === 'loop' ? (
           <input
             type="range"
-            min={2000}
+            min={1500}
             max={20000}
-            step={500}
+            step={25}
             value={steps}
             onChange={(e) => setSteps(Number(e.target.value))}
             aria-label="Target steps slider"
@@ -656,7 +707,14 @@ export default function ControlPanel({
                 ? 'Curated Drift'
                 : idx === 1
                 ? 'Quiet Alleys'
-                : 'Scenic Arc');
+                : 'Hidden Gems');
+            const badge =
+              candidate.variantBadge ||
+              (idx === 0
+                ? 'Balanced'
+                : idx === 1
+                ? 'Calm & Green'
+                : 'Local Discovery');
 
             return (
               <button
@@ -712,10 +770,18 @@ export default function ControlPanel({
                 </div>
                 <div
                   className={`text-[9px] mt-0.5 truncate ${
-                    isDark ? 'text-stone-400' : 'text-stone-500'
+                    candidate.isDirectRoute
+                      ? isDark
+                        ? 'text-amber-300 font-semibold'
+                        : 'text-amber-800 font-semibold'
+                      : isDark
+                      ? 'text-stone-400'
+                      : 'text-stone-500'
                   }`}
                 >
-                  {stopCount} stops • {candidate.quietScore || candidate.metrics?.lowTrafficPct || 95}% calm
+                  {candidate.isDirectRoute && candidate.durationBadge
+                    ? candidate.durationBadge
+                    : `${badge} • ${stopCount} stops`}
                 </div>
               </button>
             );
