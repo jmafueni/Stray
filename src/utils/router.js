@@ -45,9 +45,25 @@ export const RUN_STEP_TO_KM_FACTOR =
   RUN_METERS_PER_MIN / 1000 / RUN_STEPS_PER_MIN;
 export const STEP_TO_KM_FACTOR = WALK_STEP_TO_KM_FACTOR;
 
-export const MAX_POI_VERTEX_DISTANCE_METERS = 250;
+export const MAX_POI_POLYLINE_DISTANCE_METERS = 140;
+export const MAX_POI_VERTEX_DISTANCE_METERS = MAX_POI_POLYLINE_DISTANCE_METERS;
 export const LOOP_CALIBRATION_TOLERANCE = 0.12;
 export const POI_DURATION_TOLERANCE = 0.15;
+
+// Ordered 4-waypoint smooth teardrop/petal loop geometry around `bearingDeg`
+export const PETAL_WAYPOINT_SPECS = [
+  { angleOffsetDeg: -38, radiusFactor: 0.65 }, // Waypoint 1 (outbound leg)
+  { angleOffsetDeg: -14, radiusFactor: 1.05 }, // Waypoint 2 (far apex left)
+  { angleOffsetDeg: 16, radiusFactor: 1.05 }, // Waypoint 3 (far apex right)
+  { angleOffsetDeg: 40, radiusFactor: 0.62 }, // Waypoint 4 (return leg)
+];
+
+// Out-and-back / U-turn spur detector thresholds
+const SPUR_RESAMPLE_STEP_METERS = 5;
+const SPUR_WINDOW_METERS = 35;
+const SPUR_REVERSAL_ANGLE_DEG = 155;
+const SPUR_PROXIMITY_METERS = 18;
+const SPUR_MIN_TRACEBACK_METERS = 45;
 
 export function getPaceConfig(activityMode = 'walk') {
   return activityMode === 'run' ? PACE_CONFIG.run : PACE_CONFIG.walk;
@@ -207,30 +223,44 @@ export const ROUTE_VARIANT_SPECS = [
 
 /**
  * Resolves the deterministic compass bearing (degrees) for a loop variant.
+ * When `baseBearingDeg` is supplied (as in multi-variant generation), all 3 variants
+ * strictly rotate from that shared base (`baseBearing`, `baseBearing + 120°`, `baseBearing + 240°`)
+ * so they radiate into 3 completely distinct compass sectors.
  */
-function resolveLoopBearingDeg(
+export function resolveLoopBearingDeg(
   seed,
   exploredSectors = [],
   sectorStep = 0,
-  bearingOffsetDeg = null
+  bearingOffsetDeg = null,
+  baseBearingDeg = null
 ) {
-  const baseBearingDeg = selectUnexploredBearingDeg(seed, exploredSectors);
+  const resolvedBase =
+    typeof baseBearingDeg === 'number' && Number.isFinite(baseBearingDeg)
+      ? ((baseBearingDeg % 360) + 360) % 360
+      : selectUnexploredBearingDeg(seed, exploredSectors);
   const rotationDeg =
     typeof bearingOffsetDeg === 'number' ? bearingOffsetDeg : sectorStep * 45;
-  return (baseBearingDeg + rotationDeg) % 360;
+  return (((resolvedBase + rotationDeg) % 360) + 360) % 360;
 }
 
 /**
- * Generates 3 or 4 organic directional anchor waypoints around `origin`
- * along `bearingDeg` for a given loop span `radiusKm` (radial reach from origin to far apex,
- * where initial `radiusKm = (targetDistanceKm * variant.distanceScale) / 2.75`).
+ * Generates 4 ordered perimeter waypoints forming a smooth, wide teardrop/petal loop
+ * starting and ending at `origin` along `bearingDeg` for radial reach `radiusKm`:
+ * - Waypoint 1 (outbound leg):   `bearingDeg - 38°` at `0.65 * radiusKm`
+ * - Waypoint 2 (far apex left):  `bearingDeg - 14°` at `1.05 * radiusKm`
+ * - Waypoint 3 (far apex right): `bearingDeg + 16°` at `1.05 * radiusKm`
+ * - Waypoint 4 (return leg):     `bearingDeg + 40°` at `0.62 * radiusKm`
+ *
+ * Optional `waypointAdjustments` allows targeted spur-avoidance nudges per slot:
+ * `[{ angleDeltaDeg, radiusScale }, ...]`.
  */
-function buildLoopAnchorsForRadius(
+export function buildLoopAnchorsForRadius(
   origin,
   radiusKm,
   bearingDeg,
   activityMode = 'walk',
-  seed = 0
+  seed = 0,
+  waypointAdjustments = null
 ) {
   const [originLat, originLng] = origin;
   const latPerKm = 1 / 111.32;
@@ -238,35 +268,26 @@ function buildLoopAnchorsForRadius(
     1 / (111.32 * Math.max(0.2, Math.cos((originLat * Math.PI) / 180)));
 
   const clampedRadiusKm = Math.max(0.14, Math.min(10, Number(radiusKm) || 0.5));
-  // Circle passing through `origin` with diameter = `clampedRadiusKm` (circle radius = span / 2)
-  // gives a straight-line polygon perimeter of ~2.85 * clampedRadiusKm, matching street grid tortuosity
-  const circleRadiusKm = clampedRadiusKm / 2;
 
-  const bearingAngle = (bearingDeg * Math.PI) / 180;
-  const centerLat =
-    originLat + circleRadiusKm * Math.cos(bearingAngle) * latPerKm;
-  const centerLng =
-    originLng + circleRadiusKm * Math.sin(bearingAngle) * lngPerKm;
-
-  // 4 anchors for Walk Drift (serendipitous pentagon), 3 for Run Flow
-  const anchorFractions =
-    activityMode === 'walk' ? [0.22, 0.48, 0.74, 0.9] : [0.25, 0.5, 0.75];
-
-  return anchorFractions.map((progress, idx) => {
-    const theta = bearingAngle + Math.PI + progress * 2 * Math.PI;
-    const harmonic =
-      activityMode === 'walk'
-        ? 1 + 0.07 * Math.sin(idx * 2.1 + seed)
-        : 1 + 0.04 * Math.cos(idx * 1.7 + seed);
-    const r = circleRadiusKm * harmonic;
-    const lat = centerLat + r * Math.cos(theta) * latPerKm;
-    const lng = centerLng + r * Math.sin(theta) * lngPerKm;
+  return PETAL_WAYPOINT_SPECS.map((spec, idx) => {
+    const adj = Array.isArray(waypointAdjustments)
+      ? waypointAdjustments[idx]
+      : null;
+    const angleDeg =
+      bearingDeg + spec.angleOffsetDeg + (adj?.angleDeltaDeg || 0);
+    const rad = (angleDeg * Math.PI) / 180;
+    const distKm =
+      clampedRadiusKm * spec.radiusFactor * (adj?.radiusScale || 1);
+    const lat = originLat + distKm * Math.cos(rad) * latPerKm;
+    const lng = originLng + distKm * Math.sin(rad) * lngPerKm;
     return [Number(lat.toFixed(6)), Number(lng.toFixed(6))];
   });
 }
 
 /**
- * Convenience wrapper for initial loop anchor generation using `targetDistanceKm / 2.75`.
+ * Convenience wrapper for initial petal loop anchor generation.
+ * Straight-line petal perimeter is ~2.89 * radiusKm; with ~1.22–1.30x urban street tortuosity,
+ * `targetKm / 3.45` starts close to the final calibrated radius.
  */
 function buildLoopAnchors(
   origin,
@@ -275,15 +296,17 @@ function buildLoopAnchors(
   seed,
   exploredSectors = [],
   sectorStep = 0,
-  bearingOffsetDeg = null
+  bearingOffsetDeg = null,
+  baseBearingDeg = null
 ) {
   const bearingDeg = resolveLoopBearingDeg(
     seed,
     exploredSectors,
     sectorStep,
-    bearingOffsetDeg
+    bearingOffsetDeg,
+    baseBearingDeg
   );
-  const initialRadiusKm = Math.max(0.14, targetKm / 2.75);
+  const initialRadiusKm = Math.max(0.14, targetKm / 3.45);
   return buildLoopAnchorsForRadius(
     origin,
     initialRadiusKm,
@@ -291,6 +314,420 @@ function buildLoopAnchors(
     activityMode,
     seed
   );
+}
+
+/**
+ * Computes shortest Euclidean distance from point `(px, py)` to segment `(ax, ay)-(bx, by)`.
+ */
+function pointToSegmentDist2D(px, py, ax, ay, bx, by) {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const lenSq = dx * dx + dy * dy;
+  let t = 0;
+  if (lenSq > 0) {
+    t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / lenSq));
+  }
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+
+/**
+ * Computes shortest Euclidean distance from point `(px, py)` to a range of polyline points
+ * `pts[startIdx..endIdx]` (inclusive).
+ */
+function minDistToPlanarSubpolyline(px, py, pts, startIdx, endIdx) {
+  let minDist = Infinity;
+  if (startIdx >= endIdx) {
+    const p = pts[startIdx];
+    return p ? Math.hypot(px - p.x, py - p.y) : Infinity;
+  }
+  for (let m = startIdx; m < endIdx; m++) {
+    const d = pointToSegmentDist2D(
+      px,
+      py,
+      pts[m].x,
+      pts[m].y,
+      pts[m + 1].x,
+      pts[m + 1].y
+    );
+    if (d < minDist) {
+      minDist = d;
+      if (minDist <= 0.5) return minDist;
+    }
+  }
+  return minDist;
+}
+
+/**
+ * Inspects a polyline (default: Mapbox Directions GeoJSON `geometry.coordinates` in `[lng, lat]` order)
+ * for unnatural out-and-back / U-turn spurs.
+ *
+ * Uses subdivided arc-length samples (~5m) and sliding ~35m incoming/outgoing windows:
+ * if the path reverses direction by `> 155°` AND traces back within `18 meters` of the incoming
+ * path for more than `45 meters`, flags `hasSpur = true` and records the spur apex coordinates.
+ */
+export function analyzeOutAndBackSpurs(
+  coordinates = [],
+  {
+    coordOrder = 'geojson', // 'geojson' ([lng, lat]) | 'latlng' ([lat, lng])
+    windowMeters = SPUR_WINDOW_METERS,
+    reversalAngleDeg = SPUR_REVERSAL_ANGLE_DEG,
+    proximityMeters = SPUR_PROXIMITY_METERS,
+    minTracebackMeters = SPUR_MIN_TRACEBACK_METERS,
+    maxTurnaroundGapMeters = SPUR_PROXIMITY_METERS,
+    checkClosedLoopSeam = true,
+  } = {}
+) {
+  if (!Array.isArray(coordinates) || coordinates.length < 3) {
+    return { hasSpur: false, spurs: [] };
+  }
+
+  const getLatLng = (coord) =>
+    coordOrder === 'latlng'
+      ? [Number(coord[0]), Number(coord[1])]
+      : [Number(coord[1]), Number(coord[0])];
+
+  const [refLat, refLng] = getLatLng(coordinates[0]);
+  if (!Number.isFinite(refLat) || !Number.isFinite(refLng)) {
+    return { hasSpur: false, spurs: [] };
+  }
+  const cosLat = Math.max(0.2, Math.cos((refLat * Math.PI) / 180));
+  const metersPerLat = 111320;
+  const metersPerLng = 111320 * cosLat;
+
+  const toPlanar = (coord) => {
+    const [lat, lng] = getLatLng(coord);
+    return {
+      x: (lng - refLng) * metersPerLng,
+      y: (lat - refLat) * metersPerLat,
+      lat,
+      lng,
+    };
+  };
+
+  // Build vertex-preserving subdivided polyline (max segment <= 5m) with cumulative arc-length
+  const pts = [];
+  const cumDist = [];
+  const first = toPlanar(coordinates[0]);
+  pts.push(first);
+  cumDist.push(0);
+
+  for (let i = 1; i < coordinates.length; i++) {
+    const curr = toPlanar(coordinates[i]);
+    if (!Number.isFinite(curr.x) || !Number.isFinite(curr.y)) continue;
+    const prev = pts[pts.length - 1];
+    const segLen = Math.hypot(curr.x - prev.x, curr.y - prev.y);
+    if (segLen < 0.05) continue;
+
+    const steps = Math.max(1, Math.ceil(segLen / SPUR_RESAMPLE_STEP_METERS));
+    const baseDist = cumDist[cumDist.length - 1];
+    for (let s = 1; s <= steps; s++) {
+      const t = s / steps;
+      pts.push({
+        x: prev.x + (curr.x - prev.x) * t,
+        y: prev.y + (curr.y - prev.y) * t,
+        lat: prev.lat + (curr.lat - prev.lat) * t,
+        lng: prev.lng + (curr.lng - prev.lng) * t,
+      });
+      cumDist.push(baseDist + segLen * t);
+    }
+  }
+
+  const totalLen = cumDist[cumDist.length - 1] || 0;
+  if (pts.length < 4 || totalLen < windowMeters * 2) {
+    return { hasSpur: false, spurs: [] };
+  }
+
+  const findIndexAtDistanceBack = (idx, targetDelta) => {
+    const targetDist = cumDist[idx] - targetDelta;
+    if (targetDist <= 0) return 0;
+    let lo = 0;
+    let hi = idx;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (cumDist[mid] < targetDist) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  };
+
+  const findIndexAtDistanceForward = (idx, targetDelta) => {
+    const targetDist = cumDist[idx] + targetDelta;
+    if (targetDist >= totalLen) return -1;
+    let lo = idx;
+    let hi = pts.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (cumDist[mid] < targetDist) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  };
+
+  const computeAngleDeg = (vx1, vy1, vx2, vy2) => {
+    const m1 = Math.hypot(vx1, vy1);
+    const m2 = Math.hypot(vx2, vy2);
+    if (m1 < 10 || m2 < 10) return 0;
+    const cosTheta = Math.max(-1, Math.min(1, (vx1 * vx2 + vy1 * vy2) / (m1 * m2)));
+    return (Math.acos(cosTheta) * 180) / Math.PI;
+  };
+
+  const spurs = [];
+  let lastSpurDist = -Infinity;
+
+  // 1. Scan interior polyline for out-and-back / U-turn spurs
+  for (let i = 1; i < pts.length - 1; i++) {
+    if (cumDist[i] < windowMeters) continue;
+    if (totalLen - cumDist[i] < minTracebackMeters) break;
+    if (cumDist[i] - lastSpurDist < 30) continue;
+
+    const inStart = findIndexAtDistanceBack(i, windowMeters);
+    const inVx = pts[i].x - pts[inStart].x;
+    const inVy = pts[i].y - pts[inStart].y;
+
+    let detectedSpur = null;
+
+    for (let j = i; j < pts.length - 1; j++) {
+      if (cumDist[j] - cumDist[i] > maxTurnaroundGapMeters) break;
+
+      const outEnd = findIndexAtDistanceForward(j, windowMeters);
+      if (outEnd < 0) break;
+
+      const outVx = pts[outEnd].x - pts[j].x;
+      const outVy = pts[outEnd].y - pts[j].y;
+      const angleDeg = computeAngleDeg(inVx, inVy, outVx, outVy);
+
+      if (angleDeg <= reversalAngleDeg) continue;
+
+      // Reversal > 155° detected: verify outgoing path traces back within 18m of incoming path for > 45m
+      const lookbackStart = findIndexAtDistanceBack(i, 450);
+      let tracedMeters = 0;
+      let maxDisplacementFromApex = 0;
+
+      for (let k = j + 1; k < pts.length; k++) {
+        const dToIncoming = minDistToPlanarSubpolyline(
+          pts[k].x,
+          pts[k].y,
+          pts,
+          lookbackStart,
+          i
+        );
+        if (dToIncoming <= proximityMeters) {
+          tracedMeters = cumDist[k] - cumDist[j];
+          const disp = Math.hypot(pts[k].x - pts[i].x, pts[k].y - pts[i].y);
+          if (disp > maxDisplacementFromApex) {
+            maxDisplacementFromApex = disp;
+          }
+          if (tracedMeters > minTracebackMeters && maxDisplacementFromApex > 35) {
+            detectedSpur = {
+              apexCoord: [
+                Number(pts[i].lat.toFixed(6)),
+                Number(pts[i].lng.toFixed(6)),
+              ],
+              reversalAngleDeg: Number(angleDeg.toFixed(1)),
+              tracebackMeters: Math.round(tracedMeters),
+              progressFraction: Number((cumDist[i] / totalLen).toFixed(3)),
+              isOriginSeam: false,
+            };
+            break;
+          }
+        } else {
+          break;
+        }
+      }
+
+      if (detectedSpur) break;
+    }
+
+    if (detectedSpur) {
+      spurs.push(detectedSpur);
+      lastSpurDist = cumDist[i];
+    }
+  }
+
+  // 2. For closed loops (start ≈ end), also check for an egregious out-and-back "lollipop" stem at origin
+  //    (threshold 110m so normal 40-50m park-gate or mid-block exits from the user's starting pin aren't flagged)
+  const seamMinTracebackMeters = Math.max(110, minTracebackMeters * 2.4);
+  if (checkClosedLoopSeam && totalLen >= 300) {
+    const startPt = pts[0];
+    const endPt = pts[pts.length - 1];
+    const seamDist = Math.hypot(endPt.x - startPt.x, endPt.y - startPt.y);
+
+    if (seamDist <= proximityMeters) {
+      const endInStart = findIndexAtDistanceBack(pts.length - 1, windowMeters);
+      const startOutEnd = findIndexAtDistanceForward(0, windowMeters);
+
+      if (startOutEnd > 0 && endInStart < pts.length - 1) {
+        const inVx = endPt.x - pts[endInStart].x;
+        const inVy = endPt.y - pts[endInStart].y;
+        const outVx = pts[startOutEnd].x - startPt.x;
+        const outVy = pts[startOutEnd].y - startPt.y;
+        const seamAngleDeg = computeAngleDeg(inVx, inVy, outVx, outVy);
+
+        if (seamAngleDeg > reversalAngleDeg) {
+          const endLookbackStart = findIndexAtDistanceBack(
+            pts.length - 1,
+            Math.min(400, totalLen * 0.4)
+          );
+          let tracedMeters = 0;
+          let maxDisp = 0;
+
+          for (let k = 1; k < pts.length && cumDist[k] < totalLen * 0.4; k++) {
+            const dToReturn = minDistToPlanarSubpolyline(
+              pts[k].x,
+              pts[k].y,
+              pts,
+              endLookbackStart,
+              pts.length - 1
+            );
+            if (dToReturn <= proximityMeters) {
+              tracedMeters = cumDist[k];
+              const disp = Math.hypot(pts[k].x - startPt.x, pts[k].y - startPt.y);
+              if (disp > maxDisp) maxDisp = disp;
+              if (tracedMeters > seamMinTracebackMeters && maxDisp > seamMinTracebackMeters * 0.8) {
+                spurs.push({
+                  apexCoord: [
+                    Number(startPt.lat.toFixed(6)),
+                    Number(startPt.lng.toFixed(6)),
+                  ],
+                  reversalAngleDeg: Number(seamAngleDeg.toFixed(1)),
+                  tracebackMeters: Math.round(tracedMeters),
+                  progressFraction: 0,
+                  isOriginSeam: true,
+                });
+                break;
+              }
+            } else {
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return {
+    hasSpur: spurs.length > 0,
+    spurs,
+  };
+}
+
+/**
+ * Returns `true` if the Mapbox Directions `geometry.coordinates` polyline contains
+ * any unnatural out-and-back / U-turn spur (>155° reversal tracing back within 18m for >45m).
+ */
+export function hasOutAndBackSpur(coordinates = [], options = {}) {
+  return analyzeOutAndBackSpurs(coordinates, options).hasSpur;
+}
+
+/**
+ * Computes the geometric centroid `[lat, lng]` of a loop defined by `origin` and its ordered anchors.
+ */
+export function computeLoopCentroid(origin, anchors = []) {
+  const allPoints = [origin, ...anchors].filter(
+    (p) => Array.isArray(p) && p.length >= 2 && Number.isFinite(p[0]) && Number.isFinite(p[1])
+  );
+  if (allPoints.length === 0) return origin || [0, 0];
+  let sumLat = 0;
+  let sumLng = 0;
+  for (const [lat, lng] of allPoints) {
+    sumLat += lat;
+    sumLng += lng;
+  }
+  return [sumLat / allPoints.length, sumLng / allPoints.length];
+}
+
+/**
+ * Computes clockwise compass angle in degrees `[0, 360)` from `centroid` to `point`.
+ */
+function centroidCompassAngleDeg(centroid, point) {
+  const [cLat, cLng] = centroid;
+  const [pLat, pLng] = point;
+  const cosLat = Math.max(0.2, Math.cos((cLat * Math.PI) / 180));
+  const dx = (pLng - cLng) * cosLat;
+  const dy = pLat - cLat;
+  return (((Math.atan2(dx, dy) * 180) / Math.PI) % 360 + 360) % 360;
+}
+
+/**
+ * Determines the winding direction (`+1` clockwise, `-1` counter-clockwise) of a loop around its centroid.
+ */
+function detectLoopWindingSign(origin, anchors = [], centroid = null) {
+  const c = centroid || computeLoopCentroid(origin, anchors);
+  const ring = [origin, ...anchors, origin];
+  let signedDelta = 0;
+  for (let i = 0; i < ring.length - 1; i++) {
+    const a1 = centroidCompassAngleDeg(c, ring[i]);
+    const a2 = centroidCompassAngleDeg(c, ring[i + 1]);
+    let diff = a2 - a1;
+    while (diff > 180) diff -= 360;
+    while (diff < -180) diff += 360;
+    signedDelta += diff;
+  }
+  return signedDelta >= 0 ? 1 : -1;
+}
+
+/**
+ * Verifies that `waypoints` preserve strict monotonic forward angular progression around the
+ * loop `centroid` from `origin` (0°) back to `origin` (360°), never pulling the route backward.
+ */
+export function preservesLoopAngularProgression(
+  origin,
+  waypoints = [],
+  centroid = null,
+  windingSign = null,
+  minAngleGapDeg = 10
+) {
+  if (!origin || !Array.isArray(waypoints) || waypoints.length === 0) {
+    return true;
+  }
+  const c = centroid || computeLoopCentroid(origin, waypoints);
+  const sign =
+    typeof windingSign === 'number' && windingSign !== 0
+      ? windingSign
+      : detectLoopWindingSign(origin, waypoints, c);
+
+  const originAngle = centroidCompassAngleDeg(c, origin);
+  let prevForward = 0;
+
+  for (const wp of waypoints) {
+    if (!Array.isArray(wp) || wp.length < 2) return false;
+    // Reject points collapsed right on top of the centroid where angle is ill-defined
+    if (distanceMeters(c, wp) < 30) return false;
+
+    const rawAngle = centroidCompassAngleDeg(c, wp);
+    const forward =
+      sign > 0
+        ? (((rawAngle - originAngle) % 360) + 360) % 360
+        : (((originAngle - rawAngle) % 360) + 360) % 360;
+
+    if (forward <= prevForward + minAngleGapDeg) {
+      return false;
+    }
+    if (forward >= 360 - minAngleGapDeg) {
+      return false;
+    }
+    prevForward = forward;
+  }
+
+  return true;
+}
+
+/**
+ * Finds the nearest `[lat, lng]` point on `polyline` to `targetCoord` so POI probes
+ * anchor directly on actual walkable streets of the calibrated loop.
+ */
+function findClosestPointOnPolyline(targetCoord, polyline = []) {
+  if (!Array.isArray(polyline) || polyline.length === 0) return targetCoord;
+  let bestPt = polyline[0];
+  let bestDist = Infinity;
+  for (let i = 0; i < polyline.length; i++) {
+    const d = distanceMeters(targetCoord, polyline[i]);
+    if (d < bestDist) {
+      bestDist = d;
+      bestPt = polyline[i];
+    }
+  }
+  return bestPt;
 }
 
 /**
@@ -414,7 +851,8 @@ function sortPOIsAlongCorridor(pois, origin, destination) {
 
 /**
  * Strictly filters POIs so every kept POI:
- * 1. Lies within `maxVertexDistanceMeters` (250m) of one of the calibrated loop/corridor vertices.
+ * 1. Lies within `maxPolylineDistanceMeters` (140m) of the clean calibrated loop/corridor polyline
+ *    (or within `maxVertexDistanceMeters` of a calibrated vertex when no polyline is provided).
  * 2. Never sits near the start/end `origin` (or `destination` in Point A -> B mode).
  * 3. Maps cleanly to at most one calibrated vertex slot (`matchedAnchorIndex`) to prevent clustering.
  */
@@ -424,6 +862,8 @@ function filterPOIsNearCalibratedVertices(
   {
     origin = null,
     destination = null,
+    cleanPolyline = null,
+    maxPolylineDistanceMeters = MAX_POI_POLYLINE_DISTANCE_METERS,
     maxVertexDistanceMeters = MAX_POI_VERTEX_DISTANCE_METERS,
     minOriginDistanceMeters = 150,
     minDestinationDistanceMeters = 120,
@@ -432,6 +872,14 @@ function filterPOIsNearCalibratedVertices(
   if (!Array.isArray(pois) || pois.length === 0 || calibratedVertices.length === 0) {
     return [];
   }
+
+  const hasPolyline = Array.isArray(cleanPolyline) && cleanPolyline.length >= 2;
+  const slotAnchors = hasPolyline
+    ? calibratedVertices.map((v) => findClosestPointOnPolyline(v, cleanPolyline))
+    : calibratedVertices;
+  const maxSlotDistance = hasPolyline
+    ? Math.max(maxVertexDistanceMeters, 260)
+    : maxVertexDistanceMeters;
 
   const slotBest = new Map();
 
@@ -450,17 +898,24 @@ function filterPOIsNearCalibratedVertices(
       }
     }
 
+    const polyDist = hasPolyline
+      ? distanceToPolylineMeters(poi.coords, cleanPolyline)
+      : Infinity;
+    if (hasPolyline && polyDist > maxPolylineDistanceMeters) {
+      continue;
+    }
+
     let nearestIdx = -1;
     let nearestDist = Infinity;
-    for (let i = 0; i < calibratedVertices.length; i++) {
-      const d = distanceMeters(calibratedVertices[i], poi.coords);
+    for (let i = 0; i < slotAnchors.length; i++) {
+      const d = distanceMeters(slotAnchors[i], poi.coords);
       if (d < nearestDist) {
         nearestDist = d;
         nearestIdx = i;
       }
     }
 
-    if (nearestIdx < 0 || nearestDist > maxVertexDistanceMeters) {
+    if (nearestIdx < 0 || nearestDist > maxSlotDistance) {
       continue;
     }
 
@@ -468,10 +923,21 @@ function filterPOIsNearCalibratedVertices(
       ...poi,
       matchedAnchorIndex: nearestIdx,
       distFromAnchorMeters: Math.round(nearestDist),
+      distFromPolylineMeters: hasPolyline
+        ? Math.round(polyDist)
+        : Math.round(nearestDist),
     };
 
     const existing = slotBest.get(nearestIdx);
-    if (!existing || enriched.distFromAnchorMeters < existing.distFromAnchorMeters) {
+    const rankDist = hasPolyline
+      ? enriched.distFromPolylineMeters
+      : enriched.distFromAnchorMeters;
+    const existingRankDist = existing
+      ? hasPolyline
+        ? existing.distFromPolylineMeters
+        : existing.distFromAnchorMeters
+      : Infinity;
+    if (!existing || rankDist < existingRankDist) {
       slotBest.set(nearestIdx, enriched);
     }
   }
@@ -483,19 +949,120 @@ function filterPOIsNearCalibratedVertices(
 
 /**
  * Replaces calibrated anchor vertices with matched POIs in their exact loop/corridor slot order,
- * preserving the original calibrated anchor whenever a vertex has no matched POI so the loop
- * can never short-circuit or collapse.
+ * preserving the original calibrated anchor whenever a vertex has no qualifying POI so the loop
+ * can never short-circuit, backtrack, or collapse.
+ *
+ * When `cleanPolyline` and/or `origin` (with `isLoop: true`) are supplied, only keeps a POI if:
+ * 1. It lies within `maxPolylineDistanceMeters` (140m) of the clean loop polyline.
+ * 2. It preserves strict monotonic forward angular progression around the loop centroid
+ *    from start to finish (never pulling the route backward).
  */
-function mergePOIsIntoCalibratedAnchors(calibratedAnchors = [], matchedPOIs = []) {
+export function mergePOIsIntoCalibratedAnchors(
+  calibratedAnchors = [],
+  matchedPOIs = [],
+  {
+    cleanPolyline = null,
+    maxPolylineDistanceMeters = MAX_POI_POLYLINE_DISTANCE_METERS,
+    origin = null,
+    isLoop = false,
+    minAngleGapDeg = 10,
+    keptPOIsOut = null,
+  } = {}
+) {
   const poiBySlot = new Map();
   for (const poi of matchedPOIs) {
-    if (typeof poi.matchedAnchorIndex === 'number') {
+    if (typeof poi?.matchedAnchorIndex === 'number' && Array.isArray(poi?.coords)) {
       poiBySlot.set(poi.matchedAnchorIndex, poi);
     }
   }
-  return calibratedAnchors.map((anchorCoord, idx) =>
-    poiBySlot.has(idx) ? poiBySlot.get(idx).coords : anchorCoord
-  );
+
+  const hasPolyline = Array.isArray(cleanPolyline) && cleanPolyline.length >= 2;
+  const checkLoopAngles = Boolean(isLoop && origin && calibratedAnchors.length > 0);
+  const centroid = checkLoopAngles
+    ? computeLoopCentroid(origin, calibratedAnchors)
+    : null;
+  const windingSign = checkLoopAngles
+    ? detectLoopWindingSign(origin, calibratedAnchors, centroid)
+    : 1;
+
+  const merged = [...calibratedAnchors];
+
+  for (let idx = 0; idx < calibratedAnchors.length; idx++) {
+    const poi = poiBySlot.get(idx);
+    if (!poi) continue;
+
+    // 1. Strict distance check: within 140m of the clean loop polyline
+    if (hasPolyline) {
+      const polyDist = distanceToPolylineMeters(poi.coords, cleanPolyline);
+      if (!Number.isFinite(polyDist) || polyDist > maxPolylineDistanceMeters) {
+        continue;
+      }
+    }
+
+    // 2. Forward angular progression check around the loop centroid
+    if (checkLoopAngles) {
+      const candidateMerged = [...merged];
+      candidateMerged[idx] = poi.coords;
+      if (
+        !preservesLoopAngularProgression(
+          origin,
+          candidateMerged,
+          centroid,
+          windingSign,
+          minAngleGapDeg
+        )
+      ) {
+        continue;
+      }
+    }
+
+    merged[idx] = poi.coords;
+    if (Array.isArray(keptPOIsOut)) {
+      keptPOIsOut.push(poi);
+    }
+  }
+
+  return merged;
+}
+
+/**
+ * Generates a smooth closed Catmull-Rom spline polyline passing through `[origin, ...anchors]`
+ * and returning cleanly to `origin` (used for offline/initial-render petal loops).
+ */
+function interpolateSmoothClosedPetal(origin, anchors = [], subdivisionsPerLeg = 7) {
+  const ring = [origin, ...anchors];
+  const n = ring.length;
+  if (n < 3) return [origin, ...anchors, origin];
+
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const p0 = ring[(i - 1 + n) % n];
+    const p1 = ring[i];
+    const p2 = ring[(i + 1) % n];
+    const p3 = ring[(i + 2) % n];
+
+    for (let s = 0; s < subdivisionsPerLeg; s++) {
+      const t = s / subdivisionsPerLeg;
+      const t2 = t * t;
+      const t3 = t2 * t;
+      const lat =
+        0.5 *
+        (2 * p1[0] +
+          (-p0[0] + p2[0]) * t +
+          (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 +
+          (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3);
+      const lng =
+        0.5 *
+        (2 * p1[1] +
+          (-p0[1] + p2[1]) * t +
+          (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 +
+          (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3);
+      out.push([Number(lat.toFixed(6)), Number(lng.toFixed(6))]);
+    }
+  }
+  out[0] = origin;
+  out.push(origin);
+  return out;
 }
 
 /**
@@ -525,6 +1092,7 @@ export function generateFallbackRoute({
   variantLabel = null,
   variantBadge = null,
   sectorStep = 0,
+  baseBearingDeg = null,
   corridorStyle = 'primary',
   preloadedPOIs = null,
   visitedPoiNames = null,
@@ -555,6 +1123,7 @@ export function generateFallbackRoute({
   let distanceKm = minutesToDistanceKm(targetVariantMinutes, activityMode);
   let isDirectRoute = false;
   let durationBadge = null;
+  let resolvedBearingDeg = null;
 
   if (routeType === 'pointToPoint' && destination) {
     const directStreetKm = Math.max(0.25, haversineKm(origin, destination) * 1.25);
@@ -604,46 +1173,26 @@ export function generateFallbackRoute({
     }
     waypoints.push(destination);
   } else {
-    const [originLat, originLng] = origin;
-    const spanRadiusKm = Math.max(0.14, distanceKm / 2.75);
-    const circleRadiusKm = spanRadiusKm / 2;
-    const latPerKm = 1 / 111.32;
-    const lngPerKm =
-      1 / (111.32 * Math.max(0.2, Math.cos((originLat * Math.PI) / 180)));
-    const bearingDeg = resolveLoopBearingDeg(
+    const spanRadiusKm = Math.max(0.14, distanceKm / 3.45);
+    resolvedBearingDeg = resolveLoopBearingDeg(
       seed,
       history.exploredSectors,
       resolvedSectorStep,
-      spec.bearingOffsetDeg
+      spec.bearingOffsetDeg,
+      baseBearingDeg
     );
-    const bearingAngle = (bearingDeg * Math.PI) / 180;
-    const centerLat =
-      originLat + circleRadiusKm * Math.cos(bearingAngle) * latPerKm;
-    const centerLng =
-      originLng + circleRadiusKm * Math.sin(bearingAngle) * lngPerKm;
-
-    const numNodes = activityMode === 'walk' ? 28 : 20;
-    for (let i = 0; i <= numNodes; i++) {
-      const progress = i / numNodes;
-      const theta = bearingAngle + Math.PI + progress * 2 * Math.PI;
-      const harmonic =
-        activityMode === 'walk'
-          ? 1 +
-            0.09 *
-              Math.sin(progress * Math.PI * 6 + seed) *
-              Math.sin(progress * Math.PI)
-          : 1 +
-            0.04 *
-              Math.cos(progress * Math.PI * 4 + seed) *
-              Math.sin(progress * Math.PI);
-      const r = circleRadiusKm * harmonic;
-      waypoints.push([
-        Number((centerLat + r * Math.cos(theta) * latPerKm).toFixed(6)),
-        Number((centerLng + r * Math.sin(theta) * lngPerKm).toFixed(6)),
-      ]);
-    }
-    waypoints[0] = origin;
-    waypoints[waypoints.length - 1] = origin;
+    const petalAnchors = buildLoopAnchorsForRadius(
+      origin,
+      spanRadiusKm,
+      resolvedBearingDeg,
+      activityMode,
+      seed
+    );
+    waypoints = interpolateSmoothClosedPetal(
+      origin,
+      petalAnchors,
+      activityMode === 'walk' ? 7 : 5
+    );
   }
 
   const estimatedMinutes = distanceMetersToMinutes(
@@ -681,6 +1230,7 @@ export function generateFallbackRoute({
     variantBadge: resolvedBadge,
     quietScore,
     routeType,
+    bearingDeg: resolvedBearingDeg,
     origin,
     destination: routeType === 'pointToPoint' ? destination : null,
     waypoints,
@@ -733,6 +1283,7 @@ export async function generateUrbanRoute({
   variantLabel = null,
   variantBadge = null,
   sectorStep = 0,
+  baseBearingDeg = null,
   corridorStyle = 'primary',
   visitedPoiNames = null,
   visitedPoiIds = null,
@@ -768,6 +1319,7 @@ export async function generateUrbanRoute({
       variantLabel: resolvedLabel,
       variantBadge: resolvedBadge,
       sectorStep: resolvedSectorStep,
+      baseBearingDeg,
       corridorStyle: resolvedCorridorStyle,
       visitedPoiNames: history.visitedPoiNames,
       visitedPoiIds: history.visitedPoiIds,
@@ -787,11 +1339,12 @@ export async function generateUrbanRoute({
     const variantScale = spec.distanceScale ?? 1.0;
     const targetVariantMinutes = baseTargetMinutes * variantScale;
 
-    const fetchDirectionsForNodes = async (nodes) => {
+    const fetchDirectionsForNodes = async (nodes, { continueStraight = false } = {}) => {
       const coordsQuery = nodes
         .map(([lat, lng]) => `${lng.toFixed(6)},${lat.toFixed(6)}`)
         .join(';');
-      const url = `https://api.mapbox.com/directions/v5/mapbox/walking/${coordsQuery}?geometries=geojson&overview=full&steps=false&access_token=${activeToken}`;
+      const continueParam = continueStraight ? '&continue_straight=true' : '';
+      const url = `https://api.mapbox.com/directions/v5/mapbox/walking/${coordsQuery}?geometries=geojson&overview=full&steps=false${continueParam}&access_token=${activeToken}`;
       const res = await fetch(url, { signal });
       if (!res.ok) {
         throw new Error(`Mapbox Directions HTTP ${res.status}`);
@@ -803,15 +1356,34 @@ export async function generateUrbanRoute({
     const computeRouteMinutes = (mapboxRoute) =>
       distanceMetersToMinutesExact(mapboxRoute?.distance || 0, activityMode);
 
+    const isWithinBudget = (actualMinutes, budgetMinutes, tol = LOOP_CALIBRATION_TOLERANCE) =>
+      Math.abs(actualMinutes - budgetMinutes) / budgetMinutes <= tol;
+
     const pickClosestCandidate = (candidates, goalMinutes, budgetMinutes) => {
       if (!candidates.length) return null;
-      const withinBudget = candidates.filter(
-        (c) =>
-          Math.abs(c.actualMinutes - budgetMinutes) / budgetMinutes <=
-          LOOP_CALIBRATION_TOLERANCE
+      const cleanWithinBudget = candidates.filter(
+        (c) => !c.hasSpur && isWithinBudget(c.actualMinutes, budgetMinutes)
       );
-      const pool = withinBudget.length > 0 ? withinBudget : candidates;
+      const withinBudget = candidates.filter((c) =>
+        isWithinBudget(c.actualMinutes, budgetMinutes)
+      );
+      const cleanClose = candidates.filter(
+        (c) => !c.hasSpur && isWithinBudget(c.actualMinutes, budgetMinutes, 0.16)
+      );
+      const pool =
+        cleanWithinBudget.length > 0
+          ? cleanWithinBudget
+          : cleanClose.length > 0
+          ? cleanClose
+          : withinBudget.length > 0
+          ? withinBudget
+          : candidates;
       return pool.reduce((best, curr) => {
+        const bestSpurs = best.spurCount ?? (best.hasSpur ? 1 : 0);
+        const currSpurs = curr.spurCount ?? (curr.hasSpur ? 1 : 0);
+        if (currSpurs !== bestSpurs && pool === withinBudget) {
+          return currSpurs < bestSpurs ? curr : best;
+        }
         const bestErr = Math.abs(best.actualMinutes - goalMinutes);
         const currErr = Math.abs(curr.actualMinutes - goalMinutes);
         return currErr < bestErr ? curr : best;
@@ -820,8 +1392,10 @@ export async function generateUrbanRoute({
 
     let calibratedRoute = null;
     let calibratedAnchors = [];
+    let calibratedContinueStraight = false;
     let isDirectRoute = false;
     let durationBadge = null;
+    let resolvedBearingDeg = null;
     let minOriginDistanceMeters = 150;
     let minDestinationDistanceMeters = 0;
     let poiGoalMinutes = targetVariantMinutes;
@@ -872,7 +1446,8 @@ export async function generateUrbanRoute({
           const gentleMins = computeRouteMinutes(gentleRoute);
           if (
             gentleRoute?.geometry?.coordinates?.length >= 2 &&
-            gentleMins <= directMinutesExact * 1.1
+            gentleMins <= directMinutesExact * 1.1 &&
+            !hasOutAndBackSpur(gentleRoute.geometry.coordinates)
           ) {
             calibratedRoute = gentleRoute;
             calibratedAnchors = gentleAnchors;
@@ -911,12 +1486,15 @@ export async function generateUrbanRoute({
                 Math.min(corridorTargetDistKm * 0.45, extraKmNeeded / 2.6)
               );
 
+        const directSpurs = analyzeOutAndBackSpurs(directRoute.geometry.coordinates);
         const candidates = [
           {
             route: directRoute,
             anchors: [],
             actualMinutes: directMinutesExact,
             detourAmplitudeKm: 0,
+            hasSpur: directSpurs.hasSpur,
+            spurCount: directSpurs.spurs.length,
           },
         ];
 
@@ -943,11 +1521,16 @@ export async function generateUrbanRoute({
           }
 
           const actualMinutes = computeRouteMinutes(candidateRoute);
+          const spurAnalysis = analyzeOutAndBackSpurs(
+            candidateRoute.geometry.coordinates
+          );
           candidates.push({
             route: candidateRoute,
             anchors,
             actualMinutes,
             detourAmplitudeKm,
+            hasSpur: spurAnalysis.hasSpur,
+            spurCount: spurAnalysis.spurs.length,
           });
 
           if (actualMinutes <= 0) break;
@@ -957,7 +1540,7 @@ export async function generateUrbanRoute({
             Math.abs(actualMinutes - baseTargetMinutes) / baseTargetMinutes >
             LOOP_CALIBRATION_TOLERANCE;
 
-          if (!offVariant && !offBudget) {
+          if (!offVariant && !offBudget && !spurAnalysis.hasSpur) {
             break;
           }
 
@@ -1006,59 +1589,87 @@ export async function generateUrbanRoute({
         poiBudgetMinutes = baseTargetMinutes;
       }
     } else {
-      // Loop Mode: Iterative Multi-Pass Radial Calibration (initial pass + up to 3 refinement iterations)
-      const bearingDeg = resolveLoopBearingDeg(
+      // Loop Mode: Smooth 4-Waypoint Petal Geometry + Iterative Radial Calibration + Spur Repair
+      resolvedBearingDeg = resolveLoopBearingDeg(
         seed,
         history.exploredSectors,
         resolvedSectorStep,
-        spec.bearingOffsetDeg
+        spec.bearingOffsetDeg,
+        baseBearingDeg
       );
 
-      let radiusKm = Math.max(0.14, (targetDistanceKm * variantScale) / 2.75);
+      let radiusKm = Math.max(0.14, (targetDistanceKm * variantScale) / 3.45);
       const candidates = [];
-      const MAX_REFINEMENT_ITERATIONS = 3;
+      const MAX_REFINEMENT_ITERATIONS = 4;
+
+      const evaluateLoopCandidate = async (
+        candRadiusKm,
+        candBearingDeg,
+        waypointAdjustments = null,
+        omitSlotIndices = null,
+        continueStraight = false
+      ) => {
+        const allAnchors = buildLoopAnchorsForRadius(
+          origin,
+          candRadiusKm,
+          candBearingDeg,
+          activityMode,
+          seed,
+          waypointAdjustments
+        );
+        const anchors = [];
+        const slotIndices = [];
+        allAnchors.forEach((coord, idx) => {
+          if (!omitSlotIndices || !omitSlotIndices.has(idx)) {
+            anchors.push(coord);
+            slotIndices.push(idx);
+          }
+        });
+        if (anchors.length < 2) return null;
+
+        const route = await fetchDirectionsForNodes(
+          [origin, ...anchors, origin],
+          { continueStraight }
+        );
+        if (!route?.geometry?.coordinates || route.geometry.coordinates.length < 2) {
+          return null;
+        }
+        const actualMinutes = computeRouteMinutes(route);
+        const spurAnalysis = analyzeOutAndBackSpurs(route.geometry.coordinates);
+        return {
+          route,
+          anchors,
+          slotIndices,
+          radiusKm: candRadiusKm,
+          bearingDeg: candBearingDeg,
+          waypointAdjustments,
+          omitSlotIndices,
+          continueStraight,
+          actualMinutes,
+          hasSpur: spurAnalysis.hasSpur,
+          spurCount: spurAnalysis.spurs.length,
+          spurAnalysis,
+        };
+      };
 
       for (let iteration = 0; iteration <= MAX_REFINEMENT_ITERATIONS; iteration++) {
-        const anchors = buildLoopAnchorsForRadius(
-          origin,
-          radiusKm,
-          bearingDeg,
-          activityMode,
-          seed
-        );
-        const candidateRoute = await fetchDirectionsForNodes([
-          origin,
-          ...anchors,
-          origin,
-        ]);
-
-        if (
-          !candidateRoute?.geometry?.coordinates ||
-          candidateRoute.geometry.coordinates.length < 2
-        ) {
+        const cand = await evaluateLoopCandidate(radiusKm, resolvedBearingDeg);
+        if (!cand) {
           if (candidates.length === 0) {
             throw new Error('No street geometry returned from Mapbox Directions');
           }
           break;
         }
 
-        const actualMinutes = computeRouteMinutes(candidateRoute);
-        candidates.push({
-          route: candidateRoute,
-          anchors,
-          radiusKm,
-          actualMinutes,
-          iteration,
-        });
+        candidates.push(cand);
+        if (cand.actualMinutes <= 0) break;
 
-        if (actualMinutes <= 0) break;
-
-        const ratio = targetVariantMinutes / actualMinutes;
+        const ratio = targetVariantMinutes / cand.actualMinutes;
         const offVariant = Math.abs(1 - ratio) > LOOP_CALIBRATION_TOLERANCE;
         const offBaseBudget =
-          Math.abs(actualMinutes - baseTargetMinutes) / baseTargetMinutes > 0.1;
+          Math.abs(cand.actualMinutes - baseTargetMinutes) / baseTargetMinutes > 0.1;
 
-        if (!offVariant && !offBaseBudget) {
+        if (!offVariant && !offBaseBudget && !cand.hasSpur) {
           break;
         }
 
@@ -1072,7 +1683,7 @@ export async function generateUrbanRoute({
         }
       }
 
-      const bestLoop = pickClosestCandidate(
+      let bestLoop = pickClosestCandidate(
         candidates,
         targetVariantMinutes,
         baseTargetMinutes
@@ -1081,8 +1692,312 @@ export async function generateUrbanRoute({
         throw new Error('No calibrated loop candidate produced');
       }
 
+      // If the best calibrated loop still has an out-and-back / U-turn spur (e.g. near
+      // railway tracks, cemeteries, or cul-de-sacs), enforce continue_straight, nudge or omit
+      // the offending anchor(s), or gently rotate within this variant's 120° compass sector.
+      if (bestLoop.hasSpur) {
+        const findBadSlots = (loopCand) => {
+          const slots = new Set();
+          const slotMap =
+            loopCand.slotIndices || loopCand.anchors.map((_, idx) => idx);
+          for (const spur of loopCand.spurAnalysis?.spurs || []) {
+            if (spur.isOriginSeam) {
+              slots.add(slotMap[0]);
+              slots.add(slotMap[slotMap.length - 1]);
+              continue;
+            }
+            let nearestIdx = 0;
+            let nearestDist = Infinity;
+            loopCand.anchors.forEach((anchor, idx) => {
+              const d = distanceMeters(anchor, spur.apexCoord);
+              if (d < nearestDist) {
+                nearestDist = d;
+                nearestIdx = idx;
+              }
+            });
+            slots.add(slotMap[nearestIdx]);
+          }
+          return slots;
+        };
+
+        const evaluateAndRescalePlan = async (
+          baseRadius,
+          planBearing,
+          planAdj,
+          planOmit,
+          planContinueStraight = false
+        ) => {
+          let currRadius = baseRadius;
+          let repaired = await evaluateLoopCandidate(
+            currRadius,
+            planBearing,
+            planAdj,
+            planOmit,
+            planContinueStraight
+          );
+          if (!repaired) return false;
+          candidates.push(repaired);
+
+          if (!repaired.hasSpur) {
+            for (let rescalePass = 0; rescalePass < 2; rescalePass++) {
+              if (isWithinBudget(repaired.actualMinutes, baseTargetMinutes)) {
+                break;
+              }
+              const fixRatio = Math.max(
+                0.4,
+                Math.min(2.2, targetVariantMinutes / repaired.actualMinutes)
+              );
+              currRadius = Math.max(
+                0.12,
+                Math.min(10, currRadius * Math.pow(fixRatio, 0.85))
+              );
+              const rescaled = await evaluateLoopCandidate(
+                currRadius,
+                planBearing,
+                planAdj,
+                planOmit,
+                planContinueStraight
+              );
+              if (!rescaled) break;
+              candidates.push(rescaled);
+              repaired = rescaled;
+              if (rescaled.hasSpur) break;
+            }
+
+            const refreshedBest = pickClosestCandidate(
+              candidates,
+              targetVariantMinutes,
+              baseTargetMinutes
+            );
+            if (
+              refreshedBest &&
+              !refreshedBest.hasSpur &&
+              isWithinBudget(refreshedBest.actualMinutes, baseTargetMinutes)
+            ) {
+              bestLoop = refreshedBest;
+              return true;
+            }
+          }
+          return false;
+        };
+
+        const badSlotSet = findBadSlots(bestLoop);
+        const buildSlotAdjustment = (fn) =>
+          PETAL_WAYPOINT_SPECS.map((_, idx) => (badSlotSet.has(idx) ? fn(idx) : null));
+        const primaryBadSlot = Array.from(badSlotSet)[0];
+
+        const hasOriginSeamSpur = (bestLoop.spurAnalysis?.spurs || []).some(
+          (s) => s.isOriginSeam
+        );
+
+        const repairPlans = [
+          // 1. Disallow U-turns at intermediate anchors with Mapbox continue_straight=true
+          {
+            bearingDeg: bestLoop.bearingDeg,
+            adjustments: null,
+            omit: null,
+            continueStraight: true,
+          },
+          // 1b. If an origin lollipop stem was detected, widen the outbound/return opening
+          ...(hasOriginSeamSpur
+            ? [
+                {
+                  bearingDeg: bestLoop.bearingDeg,
+                  adjustments: [
+                    { angleDeltaDeg: -14, radiusScale: 0.9 },
+                    null,
+                    null,
+                    { angleDeltaDeg: 14, radiusScale: 0.9 },
+                  ],
+                  omit: null,
+                  continueStraight: true,
+                },
+              ]
+            : []),
+          // 2. Pull offending anchor(s) radially inward onto interior through-streets
+          {
+            bearingDeg: bestLoop.bearingDeg,
+            adjustments: buildSlotAdjustment((idx) => ({
+              radiusScale: 0.78,
+              angleDeltaDeg: idx <= 1 ? 8 : -8,
+            })),
+            omit: null,
+            continueStraight: true,
+          },
+          // 3. Omit the primary blocked anchor so the loop smoothly bypasses the dead-end/barrier
+          ...(typeof primaryBadSlot === 'number'
+            ? [
+                {
+                  bearingDeg: bestLoop.bearingDeg,
+                  adjustments: null,
+                  omit: new Set([primaryBadSlot]),
+                  continueStraight: true,
+                },
+              ]
+            : []),
+          // 4. Gently rotate entire petal -12° / +12° with continue_straight=true (strictly inside 120° sector)
+          {
+            bearingDeg: (bestLoop.bearingDeg + 348) % 360,
+            adjustments: null,
+            omit: null,
+            continueStraight: true,
+          },
+          {
+            bearingDeg: (bestLoop.bearingDeg + 12) % 360,
+            adjustments: null,
+            omit: null,
+            continueStraight: true,
+          },
+          // 5. Clear major urban barriers (e.g. walled cemeteries / railway trenches) with ±20° shift
+          //    (still maintains ~100° separation from neighboring 120° sectors)
+          {
+            bearingDeg: (bestLoop.bearingDeg + 340) % 360,
+            adjustments: null,
+            omit: null,
+            continueStraight: true,
+          },
+          {
+            bearingDeg: (bestLoop.bearingDeg + 20) % 360,
+            adjustments: null,
+            omit: null,
+            continueStraight: true,
+          },
+          // 6. Push offending anchor(s) tangentially around a barrier
+          {
+            bearingDeg: bestLoop.bearingDeg,
+            adjustments: buildSlotAdjustment((idx) => ({
+              radiusScale: 1.08,
+              angleDeltaDeg: idx <= 1 ? -16 : 16,
+            })),
+            omit: null,
+            continueStraight: true,
+          },
+        ];
+
+        let repairedCleanly = false;
+        for (const plan of repairPlans) {
+          repairedCleanly = await evaluateAndRescalePlan(
+            bestLoop.radiusKm,
+            plan.bearingDeg,
+            plan.adjustments,
+            plan.omit,
+            plan.continueStraight
+          );
+          if (repairedCleanly) break;
+        }
+
+        // Stage 2: If a repair candidate reduced spurs to 1, directly omit/nudge THAT candidate's
+        // true remaining offending anchor slot (with continue_straight) until spur-free within ±12%.
+        if (!repairedCleanly) {
+          const fewestSpurCand = candidates.reduce((best, curr) => {
+            if (curr.spurCount !== best.spurCount) {
+              return curr.spurCount < best.spurCount ? curr : best;
+            }
+            return Math.abs(curr.actualMinutes - targetVariantMinutes) <
+              Math.abs(best.actualMinutes - targetVariantMinutes)
+              ? curr
+              : best;
+          });
+
+          if (fewestSpurCand && fewestSpurCand.hasSpur && fewestSpurCand.anchors.length >= 3) {
+            const stage2HasOriginSeam = (fewestSpurCand.spurAnalysis?.spurs || []).some(
+              (s) => s.isOriginSeam
+            );
+            if (stage2HasOriginSeam) {
+              repairedCleanly = await evaluateAndRescalePlan(
+                fewestSpurCand.radiusKm,
+                fewestSpurCand.bearingDeg,
+                [
+                  { angleDeltaDeg: -16, radiusScale: 0.9 },
+                  null,
+                  null,
+                  { angleDeltaDeg: 16, radiusScale: 0.9 },
+                ],
+                null,
+                true
+              );
+            }
+            const stage2BadSlots = findBadSlots(fewestSpurCand);
+            const stage2Slot = Array.from(stage2BadSlots)[0];
+            if (!repairedCleanly && typeof stage2Slot === 'number') {
+              const combinedOmit = new Set([
+                ...(fewestSpurCand.omitSlotIndices || []),
+                stage2Slot,
+              ]);
+              if (combinedOmit.size <= 2) {
+                repairedCleanly = await evaluateAndRescalePlan(
+                  fewestSpurCand.radiusKm,
+                  fewestSpurCand.bearingDeg,
+                  fewestSpurCand.waypointAdjustments,
+                  combinedOmit,
+                  true
+                );
+              }
+              if (!repairedCleanly) {
+                const inwardAdj = PETAL_WAYPOINT_SPECS.map((_, idx) =>
+                  idx === stage2Slot
+                    ? { radiusScale: 0.72, angleDeltaDeg: idx <= 1 ? 10 : -10 }
+                    : fewestSpurCand.waypointAdjustments?.[idx] || null
+                );
+                await evaluateAndRescalePlan(
+                  fewestSpurCand.radiusKm,
+                  fewestSpurCand.bearingDeg,
+                  inwardAdj,
+                  fewestSpurCand.omitSlotIndices,
+                  true
+                );
+              }
+            }
+          }
+        }
+
+        bestLoop = pickClosestCandidate(
+          candidates,
+          targetVariantMinutes,
+          baseTargetMinutes
+        );
+      }
+
+      // Final precision pass: if the selected spur-free loop is still outside ±12% of target
+      // (e.g. due to a nonlinear street-grid jump), run up to 2 damped radial scale passes.
+      if (
+        bestLoop &&
+        !isWithinBudget(bestLoop.actualMinutes, baseTargetMinutes)
+      ) {
+        let fineRadius = bestLoop.radiusKm;
+        let lastCand = bestLoop;
+        for (let finePass = 0; finePass < 2; finePass++) {
+          if (isWithinBudget(lastCand.actualMinutes, baseTargetMinutes)) break;
+          const fineRatio = Math.max(
+            0.45,
+            Math.min(2.0, targetVariantMinutes / lastCand.actualMinutes)
+          );
+          fineRadius = Math.max(
+            0.12,
+            Math.min(10, fineRadius * Math.pow(fineRatio, 0.85))
+          );
+          const fineCand = await evaluateLoopCandidate(
+            fineRadius,
+            bestLoop.bearingDeg,
+            bestLoop.waypointAdjustments,
+            bestLoop.omitSlotIndices,
+            bestLoop.continueStraight
+          );
+          if (!fineCand) break;
+          candidates.push(fineCand);
+          lastCand = fineCand;
+        }
+        bestLoop = pickClosestCandidate(
+          candidates,
+          targetVariantMinutes,
+          baseTargetMinutes
+        );
+      }
+
       calibratedRoute = bestLoop.route;
       calibratedAnchors = bestLoop.anchors;
+      calibratedContinueStraight = Boolean(bestLoop.continueStraight);
+      resolvedBearingDeg = bestLoop.bearingDeg;
       // Keep POIs clearly away from start/end origin (scales cleanly for short & long loops)
       minOriginDistanceMeters = Math.max(
         110,
@@ -1090,9 +2005,19 @@ export async function generateUrbanRoute({
       );
     }
 
-    // Step 2: Discover real POIs strictly within 250m of the ALREADY-CALIBRATED loop/corridor vertices
+    const calibratedLatLngs = geoJsonToLatLngs(
+      calibratedRoute.geometry.coordinates
+    );
+    const baseSpurAnalysis = analyzeOutAndBackSpurs(
+      calibratedRoute.geometry.coordinates
+    );
+
+    // Step 2: Discover real POIs strictly within 140m of the ALREADY-CALIBRATED clean loop polyline
+    const snappedPOIProbes = calibratedAnchors.map((anchor) =>
+      findClosestPointOnPolyline(anchor, calibratedLatLngs)
+    );
     const rawPOIs = await fetchRealPOIsAlongRoute(
-      calibratedAnchors,
+      snappedPOIProbes,
       activityMode,
       activeToken,
       {
@@ -1102,7 +2027,9 @@ export async function generateUrbanRoute({
         signal,
         visitedPoiNames: history.visitedPoiNames,
         visitedPoiIds: history.visitedPoiIds,
-        maxDistanceFromAnchorMeters: MAX_POI_VERTEX_DISTANCE_METERS,
+        routePolyline: calibratedLatLngs,
+        maxPolylineDistanceMeters: MAX_POI_POLYLINE_DISTANCE_METERS,
+        maxDistanceFromAnchorMeters: 220,
         origin,
         destination: routeType === 'pointToPoint' ? destination : null,
         minDistanceFromOriginMeters: minOriginDistanceMeters,
@@ -1114,6 +2041,8 @@ export async function generateUrbanRoute({
     let filteredPOIs = filterPOIsNearCalibratedVertices(rawPOIs, calibratedAnchors, {
       origin,
       destination: routeType === 'pointToPoint' ? destination : null,
+      cleanPolyline: calibratedLatLngs,
+      maxPolylineDistanceMeters: MAX_POI_POLYLINE_DISTANCE_METERS,
       maxVertexDistanceMeters: MAX_POI_VERTEX_DISTANCE_METERS,
       minOriginDistanceMeters: minOriginDistanceMeters,
       minDestinationDistanceMeters: minDestinationDistanceMeters,
@@ -1123,12 +2052,13 @@ export async function generateUrbanRoute({
       filteredPOIs = sortPOIsAlongCorridor(filteredPOIs, origin, destination);
     }
 
-    // Step 3: Insert filtered POIs into the calibrated anchor slots & re-verify duration stays within tolerance
-    // (dropping outlier POIs if they distort duration beyond ±15%, or keeping the calibrated loop)
+    // Step 3: Insert filtered POIs into calibrated anchor slots ONLY when each POI:
+    //   1. Lies within 140m of the clean loop polyline.
+    //   2. Preserves monotonic forward angular progression around the loop centroid.
+    //   3. Does NOT introduce an out-and-back / U-turn spur (`hasOutAndBackSpur === false`)
+    //      and keeps duration within tolerance.
+    // Otherwise skip offending POI(s) and fall back gracefully to the smooth circular loop.
     let primaryRoute = calibratedRoute;
-    const calibratedLatLngs = geoJsonToLatLngs(
-      calibratedRoute.geometry.coordinates
-    );
 
     const isPOIInsertionWithinTolerance = (candidateMinutes) => {
       if (!Number.isFinite(candidateMinutes) || candidateMinutes <= 0) {
@@ -1146,63 +2076,115 @@ export async function generateUrbanRoute({
       return withinTargetBudget && withinVariantWindow;
     };
 
+    const getPoiKey = (poi) =>
+      String(poi?.id || `${poi?.name || ''}-${poi?.coords?.[0]}-${poi?.coords?.[1]}`);
+
     if (filteredPOIs.length > 0) {
       let activePOIs = [...filteredPOIs];
       let acceptedPOIRoute = null;
-      const MAX_POI_PRUNE_ATTEMPTS = Math.min(3, activePOIs.length);
+      const spurRejectedKeys = new Set();
+      const MAX_POI_PRUNE_ATTEMPTS = Math.min(4, activePOIs.length);
 
       for (let attempt = 0; attempt < MAX_POI_PRUNE_ATTEMPTS; attempt++) {
         if (activePOIs.length === 0) break;
 
+        const keptPOIs = [];
         const mergedWaypoints = mergePOIsIntoCalibratedAnchors(
           calibratedAnchors,
-          activePOIs
+          activePOIs,
+          {
+            cleanPolyline: calibratedLatLngs,
+            maxPolylineDistanceMeters: MAX_POI_POLYLINE_DISTANCE_METERS,
+            origin,
+            isLoop: routeType !== 'pointToPoint',
+            keptPOIsOut: keptPOIs,
+          }
         );
+
+        if (keptPOIs.length === 0) {
+          break;
+        }
+
         const queryNodes =
           routeType === 'pointToPoint' && destination
             ? [origin, ...mergedWaypoints, destination]
             : [origin, ...mergedWaypoints, origin];
 
-        const poiRoute = await fetchDirectionsForNodes(queryNodes);
+        const poiRoute = await fetchDirectionsForNodes(queryNodes, {
+          continueStraight: calibratedContinueStraight,
+        });
         const poiMinutes = computeRouteMinutes(poiRoute);
+        const poiCoords = poiRoute?.geometry?.coordinates || [];
+        const poiSpurAnalysis = analyzeOutAndBackSpurs(poiCoords);
+
+        const introducedSpur =
+          poiSpurAnalysis.hasSpur &&
+          (!baseSpurAnalysis.hasSpur ||
+            poiSpurAnalysis.spurs.some((s) => !s.isOriginSeam) ||
+            poiSpurAnalysis.spurs.length > baseSpurAnalysis.spurs.length);
 
         if (
-          poiRoute?.geometry?.coordinates?.length >= 2 &&
+          poiCoords.length >= 2 &&
+          !introducedSpur &&
           isPOIInsertionWithinTolerance(poiMinutes)
         ) {
           acceptedPOIRoute = poiRoute;
-          discoveredPOIs = activePOIs;
+          discoveredPOIs = keptPOIs;
           break;
         }
 
-        // Drop the single biggest outlier POI (furthest from calibrated polyline / anchor vertex)
-        if (activePOIs.length <= 1) {
+        if (introducedSpur) {
+          // Identify the exact POI closest to the detected U-turn spur apex and skip it
+          const targetSpur =
+            poiSpurAnalysis.spurs.find((s) => !s.isOriginSeam) ||
+            poiSpurAnalysis.spurs[0];
+          let culpritPoi = keptPOIs[0];
+          let minSpurDist = Infinity;
+          for (const poi of keptPOIs) {
+            const d = targetSpur?.apexCoord
+              ? distanceMeters(poi.coords, targetSpur.apexCoord)
+              : Infinity;
+            if (d < minSpurDist) {
+              minSpurDist = d;
+              culpritPoi = poi;
+            }
+          }
+          const culpritKey = getPoiKey(culpritPoi);
+          spurRejectedKeys.add(culpritKey);
+          activePOIs = activePOIs.filter((p) => getPoiKey(p) !== culpritKey);
+          continue;
+        }
+
+        // Duration drifted without a spur: drop the single POI furthest from the clean polyline
+        if (keptPOIs.length <= 1) {
           break;
         }
-        let worstIdx = 0;
+        let worstPoi = keptPOIs[0];
         let worstScore = -1;
-        activePOIs.forEach((poi, idx) => {
+        for (const poi of keptPOIs) {
           const polyDist = distanceToPolylineMeters(poi.coords, calibratedLatLngs);
           const score =
-            (Number.isFinite(polyDist) ? polyDist : 300) +
+            (Number.isFinite(polyDist) ? polyDist : 300) * 2 +
             (poi.distFromAnchorMeters || 0);
           if (score > worstScore) {
             worstScore = score;
-            worstIdx = idx;
+            worstPoi = poi;
           }
-        });
-        activePOIs = activePOIs.filter((_, idx) => idx !== worstIdx);
+        }
+        const worstKey = getPoiKey(worstPoi);
+        activePOIs = activePOIs.filter((p) => getPoiKey(p) !== worstKey);
       }
 
       if (acceptedPOIRoute) {
         primaryRoute = acceptedPOIRoute;
       } else {
-        // Keep the cleanly calibrated loop/corridor geometry and retain only POIs right along the polyline
+        // Fallback gracefully to the smooth circular loop geometry without forcing any U-turn detour
         primaryRoute = calibratedRoute;
         discoveredPOIs = filteredPOIs.filter(
           (poi) =>
+            !spurRejectedKeys.has(getPoiKey(poi)) &&
             distanceToPolylineMeters(poi.coords, calibratedLatLngs) <=
-            MAX_POI_VERTEX_DISTANCE_METERS
+              MAX_POI_POLYLINE_DISTANCE_METERS
         );
       }
     }
@@ -1257,6 +2239,7 @@ export async function generateUrbanRoute({
       variantBadge: resolvedBadge,
       quietScore,
       routeType,
+      bearingDeg: resolvedBearingDeg,
       origin,
       destination: routeType === 'pointToPoint' ? destination : null,
       waypoints,
@@ -1301,6 +2284,7 @@ export async function generateUrbanRoute({
       variantLabel: resolvedLabel,
       variantBadge: resolvedBadge,
       sectorStep: resolvedSectorStep,
+      baseBearingDeg,
       corridorStyle: resolvedCorridorStyle,
       preloadedPOIs: discoveredPOIs,
       visitedPoiNames: history.visitedPoiNames,
@@ -1312,7 +2296,7 @@ export async function generateUrbanRoute({
 
 /**
  * Synchronously generates 3 distinct fallback route candidates (Curated Drift, Quiet Alleys, Hidden Gems)
- * for immediate initial render or offline mode.
+ * for immediate initial render or offline mode, radiating into 3 strictly separated 120° compass sectors.
  */
 export function generateFallbackRouteAlternatives(params = {}) {
   const {
@@ -1335,6 +2319,10 @@ export function generateFallbackRouteAlternatives(params = {}) {
       ? { visitedPoiNames, visitedPoiIds: visitedPoiIds || [], exploredSectors }
       : loadDriftHistory();
 
+  // Compute ONE shared base bearing from `seed` so all 3 variants strictly occupy
+  // `baseBearing`, `baseBearing + 120°`, and `baseBearing + 240°`.
+  const baseBearingDeg = selectUnexploredBearingDeg(seed, history.exploredSectors);
+
   const usedPoiNamesAcrossVariants = new Set(
     (history.visitedPoiNames || []).map((n) => String(n).toLowerCase())
   );
@@ -1356,6 +2344,7 @@ export function generateFallbackRouteAlternatives(params = {}) {
       variantLabel: spec.variantLabel,
       variantBadge: spec.variantBadge,
       sectorStep: spec.sectorStep,
+      baseBearingDeg,
       corridorStyle: spec.corridorStyle,
       visitedPoiNames: Array.from(usedPoiNamesAcrossVariants),
       visitedPoiIds: history.visitedPoiIds,
@@ -1373,9 +2362,9 @@ export function generateFallbackRouteAlternatives(params = {}) {
 /**
  * Generates 3 distinct urban route candidates simultaneously in parallel (`Promise.all`),
  * all strictly calibrated to the user's chosen duration/step budget (within ±12%):
- * - Route 1 ("Curated Drift" — Balanced): Primary unexplored compass sector, balanced mix of lively side streets & curated stops
- * - Route 2 ("Quiet Alleys" — Calm & Green): Rotated compass sector (+120° in Loop, left-flank corridor in Point A -> B) prioritizing parks & quiet lanes
- * - Route 3 ("Hidden Gems" — Local Discovery): Opposite compass sector (+240° in Loop, right-flank corridor in Point A -> B) routed toward distinct culinary/cultural POIs
+ * - Route 1 ("Curated Drift" — Balanced): Primary unexplored compass sector (`baseBearing`), balanced mix of lively side streets & curated stops
+ * - Route 2 ("Quiet Alleys" — Calm & Green): Rotated compass sector (`baseBearing + 120°` in Loop, left-flank corridor in Point A -> B) prioritizing parks & quiet lanes
+ * - Route 3 ("Hidden Gems" — Local Discovery): Opposite compass sector (`baseBearing + 240°` in Loop, right-flank corridor in Point A -> B) routed toward distinct culinary/cultural POIs
  */
 export async function generateRouteAlternatives(params = {}) {
   const {
@@ -1411,6 +2400,10 @@ export async function generateRouteAlternatives(params = {}) {
     });
   }
 
+  // Compute ONE shared base bearing from `seed` so all 3 variants strictly occupy
+  // `baseBearing`, `baseBearing + 120°`, and `baseBearing + 240°`.
+  const baseBearingDeg = selectUnexploredBearingDeg(seed, history.exploredSectors);
+
   const results = await Promise.all(
     ROUTE_VARIANT_SPECS.map((spec) => {
       const variantSeed = seed + spec.seedStep;
@@ -1429,6 +2422,7 @@ export async function generateRouteAlternatives(params = {}) {
         variantLabel: spec.variantLabel,
         variantBadge: spec.variantBadge,
         sectorStep: spec.sectorStep,
+        baseBearingDeg,
         corridorStyle: spec.corridorStyle,
         visitedPoiNames: history.visitedPoiNames,
         visitedPoiIds: history.visitedPoiIds,

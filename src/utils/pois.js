@@ -804,13 +804,13 @@ async function queryMapboxCategoryAroundPoint(
   categorySpec,
   token,
   signal,
-  searchRadiusMeters = 380
+  searchRadiusMeters = 280
 ) {
   const [lat, lng] = anchorCoord;
   const proximity = `${lng.toFixed(5)},${lat.toFixed(5)}`;
 
   // Tight metric bounding box around the calibrated vertex so Mapbox prioritizes immediately adjacent venues
-  const clampedRadius = Math.max(250, Math.min(1200, Number(searchRadiusMeters) || 380));
+  const clampedRadius = Math.max(180, Math.min(1200, Number(searchRadiusMeters) || 280));
   const latDelta = clampedRadius / 111320;
   const lngDelta =
     clampedRadius / (111320 * Math.max(0.2, Math.cos((lat * Math.PI) / 180)));
@@ -862,8 +862,9 @@ async function queryMapboxCategoryAroundPoint(
  * Fetches 3 to 4 distinct, authentic real-world POIs strictly along the route's calibrated anchors/waypoints
  * using the Mapbox Search Box API (`/search/searchbox/v1/category/{category}` or `/search/searchbox/v1/forward`).
  *
- * Enforces strict proximity (`maxDistanceFromAnchorMeters`, default 250m) to calibrated vertices and keeps
- * POIs away from `origin` / `destination` so they never short-circuit or bloat the calibrated loop.
+ * Enforces strict proximity (`maxPolylineDistanceMeters` / `maxDistanceFromAnchorMeters`, default 140m)
+ * to the clean loop/corridor polyline and keeps POIs away from `origin` / `destination` so they never
+ * cause U-turn spurs or bloat the calibrated loop.
  */
 export async function fetchRealPOIsAlongRoute(
   waypoints = [],
@@ -882,13 +883,20 @@ export async function fetchRealPOIsAlongRoute(
     signal,
     visitedPoiNames = [],
     visitedPoiIds = [],
-    maxDistanceFromAnchorMeters = 250,
+    maxDistanceFromAnchorMeters = 140,
+    routePolyline = null,
+    maxPolylineDistanceMeters = 140,
     origin = null,
     destination = null,
     minDistanceFromOriginMeters = 0,
     minDistanceFromDestinationMeters = 0,
     allowFallback = true,
   } = options;
+
+  const activePolyline =
+    Array.isArray(routePolyline) && routePolyline.length >= 2
+      ? routePolyline
+      : null;
 
   if (!waypoints || waypoints.length === 0) {
     return [];
@@ -950,8 +958,13 @@ export async function fetchRealPOIsAlongRoute(
   }));
 
   const searchRadiusMeters = Math.max(
-    320,
-    Math.min(950, Math.round(maxDistanceFromAnchorMeters * 1.45))
+    200,
+    Math.min(
+      700,
+      Math.round(
+        Math.max(maxDistanceFromAnchorMeters, maxPolylineDistanceMeters) * 1.65
+      )
+    )
   );
 
   const pickBestFromFeatures = (features, anchorCoord, spec, idx, usedNames, discoveredPOIs) => {
@@ -973,6 +986,9 @@ export async function fetchRealPOIsAlongRoute(
 
         const coords = [Number(lat.toFixed(6)), Number(lng.toFixed(6))];
         const distFromAnchor = distanceMeters(anchorCoord, coords);
+        const distFromPolyline = activePolyline
+          ? distanceToPolylineMeters(coords, activePolyline)
+          : distFromAnchor;
         return {
           feat,
           featId,
@@ -981,10 +997,19 @@ export async function fetchRealPOIsAlongRoute(
           wasVisited,
           coords,
           distFromAnchor,
+          distFromPolyline,
         };
       })
       .filter(Boolean)
-      .filter((item) => item.distFromAnchor <= maxDistanceFromAnchorMeters)
+      .filter((item) => {
+        if (activePolyline) {
+          return (
+            item.distFromPolyline <= maxPolylineDistanceMeters &&
+            item.distFromAnchor <= Math.max(maxDistanceFromAnchorMeters, 240)
+          );
+        }
+        return item.distFromAnchor <= maxDistanceFromAnchorMeters;
+      })
       .filter((item) => {
         if (origin && minDistanceFromOriginMeters > 0) {
           if (distanceMeters(origin, item.coords) < minDistanceFromOriginMeters) {
@@ -998,7 +1023,11 @@ export async function fetchRealPOIsAlongRoute(
         }
         return true;
       })
-      .sort((a, b) => a.distFromAnchor - b.distFromAnchor);
+      .sort((a, b) => {
+        const polyDiff = a.distFromPolyline - b.distFromPolyline;
+        if (Math.abs(polyDiff) > 8) return polyDiff;
+        return a.distFromAnchor - b.distFromAnchor;
+      });
 
     // Deduplicate against venues already picked in this route and ensure >60m spacing
     const uniqueCandidates = candidates.filter((c) => {
@@ -1020,7 +1049,10 @@ export async function fetchRealPOIsAlongRoute(
     usedNames.add(chosen.normName);
 
     const { streetName, address } = extractStreetAndAddress(chosen.feat);
-    const detourMeters = calculateDetourMeters(chosen.coords, waypoints);
+    const detourMeters = calculateDetourMeters(
+      chosen.coords,
+      activePolyline || waypoints
+    );
     const vibeScore = Math.min(
       98,
       Math.max(88, 91 + ((chosen.name.length + idx * 3 + seed) % 7))
@@ -1048,6 +1080,7 @@ export async function fetchRealPOIsAlongRoute(
       detourMeters,
       anchorIndex: idx,
       distFromAnchorMeters: Math.round(chosen.distFromAnchor),
+      distFromPolylineMeters: Math.round(chosen.distFromPolyline),
       note: buildEditorialFieldNote(
         streetName,
         presentation.type,
