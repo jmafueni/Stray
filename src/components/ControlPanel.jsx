@@ -156,20 +156,20 @@ export default function ControlPanel({
 
   return (
     <div
-      className={`pointer-events-none absolute bottom-4 inset-x-3 z-20 mx-auto transition-all duration-300 md:inset-x-auto md:left-6 md:bottom-6 md:mx-0 md:w-[410px] md:max-w-[410px] ${
+      className={`pointer-events-none absolute bottom-4 inset-x-3 z-20 mx-auto transform-gpu will-change-transform transition-all duration-300 md:inset-x-auto md:left-6 md:bottom-6 md:mx-0 md:w-[410px] md:max-w-[410px] ${
         isPanelExpanded ? 'max-w-md' : 'max-w-2xl'
       }`}
     >
       <section
         aria-label="Stray Route Controls"
-        className={`pointer-events-auto w-full backdrop-blur-xl border rounded-3xl shadow-2xl transition-all duration-300 ${
+        className={`pointer-events-auto w-full transform-gpu will-change-transform border rounded-3xl shadow-2xl transition-all duration-300 ${
           isPanelExpanded
             ? 'p-4 sm:p-5 max-h-[calc(100dvh-5.5rem)] overflow-y-auto no-scrollbar'
             : 'p-3 sm:p-3.5'
         } ${
           isDark
-            ? 'bg-[#18181B]/95 border-white/15 text-[#F4F1EA] shadow-black/70'
-            : 'bg-[#F4F1EA]/95 border-[#1C1C1E]/15 text-[#1C1C1E] shadow-[0_16px_48px_rgba(28,28,30,0.18)]'
+            ? 'bg-[#18181B]/[0.96] border-white/15 text-[#F4F1EA] shadow-black/70'
+            : 'bg-[#F4F1EA]/[0.96] border-[#1C1C1E]/15 text-[#1C1C1E] shadow-[0_16px_48px_rgba(28,28,30,0.18)]'
         }`}
       >
         {!isPanelExpanded ? (

@@ -15,9 +15,9 @@ import { Maximize2, LocateFixed, Plus, Minus } from 'lucide-react';
 
 const MAPBOX_TOKEN = (import.meta.env.VITE_MAPBOX_TOKEN || '').trim();
 
-// Upgraded editorial Mapbox styles reveal parks, water bodies, pedestrian plazas, and building footprints
-const MAPBOX_PAPER_TILES = `https://api.mapbox.com/styles/v1/mapbox/streets-v12/tiles/{z}/{x}/{y}@2x?access_token=${MAPBOX_TOKEN}`;
-const MAPBOX_DARK_TILES = `https://api.mapbox.com/styles/v1/mapbox/navigation-night-v1/tiles/{z}/{x}/{y}@2x?access_token=${MAPBOX_TOKEN}`;
+// Native 512px Mapbox raster tiles deliver crisp 2x density with 4x fewer tile requests
+const MAPBOX_PAPER_TILES = `https://api.mapbox.com/styles/v1/mapbox/outdoors-v12/tiles/512/{z}/{x}/{y}?access_token=${MAPBOX_TOKEN}`;
+const MAPBOX_DARK_TILES = `https://api.mapbox.com/styles/v1/mapbox/navigation-night-v1/tiles/512/{z}/{x}/{y}?access_token=${MAPBOX_TOKEN}`;
 
 // Fallback public tiles if VITE_MAPBOX_TOKEN is not configured
 const FALLBACK_PAPER_TILES =
@@ -164,13 +164,13 @@ function createAlternativeCalloutIcon({ altRoute, isDark = false }) {
   const km = altRoute?.distanceKm || 3.5;
   const label = altRoute?.variantLabel || 'Alt Route';
 
-  const bg = isDark ? 'rgba(24, 24, 27, 0.92)' : 'rgba(244, 241, 234, 0.94)';
+  const bg = isDark ? 'rgba(24, 24, 27, 0.96)' : 'rgba(244, 241, 234, 0.96)';
   const text = isDark ? '#D4D4D8' : '#3F3F46';
   const accent = isDark ? '#F4F1EA' : '#1C1C1E';
   const border = isDark ? 'rgba(255,255,255,0.18)' : 'rgba(28,28,30,0.18)';
 
   const html = `
-    <div style="transform:translate(-50%,-50%);cursor:pointer;white-space:nowrap;padding:3px 9px;border-radius:9999px;background:${bg};color:${text};border:1px solid ${border};box-shadow:0 4px 14px rgba(0,0,0,0.16);backdrop-filter:blur(8px);display:inline-flex;align-items:center;gap:5px;font-family:'Plus Jakarta Sans',sans-serif;font-size:10px;font-weight:700;transition:transform 0.15s ease;">
+    <div style="transform:translate(-50%,-50%);cursor:pointer;white-space:nowrap;padding:3px 9px;border-radius:9999px;background:${bg};color:${text};border:1px solid ${border};box-shadow:0 4px 14px rgba(0,0,0,0.16);display:inline-flex;align-items:center;gap:5px;font-family:'Plus Jakarta Sans',sans-serif;font-size:10px;font-weight:700;transition:transform 0.15s ease;">
       <span style="font-family:'Fraunces',Georgia,serif;color:${accent};font-weight:700;">${escapeHtml(
         String(mins)
       )} min</span>
@@ -317,6 +317,7 @@ function MapViewportUpdater({
   mapInstanceRef,
 }) {
   const map = useMap();
+  const lastFitSignatureRef = useRef(null);
 
   useEffect(() => {
     if (mapInstanceRef) {
@@ -339,9 +340,23 @@ function MapViewportUpdater({
     };
   }, [map]);
 
-  // Fit bounds with responsive asymmetric padding so all 3 route petals & POIs sit cleanly in the unobstructed map canvas
+  // Fit bounds ONLY when the route IDs, route type, endpoints, or panel expansion state actually change
   useEffect(() => {
     if (selectedPOI?.coords || isDrifting) return;
+
+    const routeIdsKey = Array.isArray(candidateRoutes)
+      ? candidateRoutes.map((r) => r?.id || '').join('|')
+      : '';
+    const originKey = isValidLatLng(origin) ? `${origin[0]},${origin[1]}` : '';
+    const destKey =
+      routeType === 'pointToPoint' && isValidLatLng(destination)
+        ? `${destination[0]},${destination[1]}`
+        : '';
+    const fitSignature = `${routeIdsKey}::${activeRoute?.id || ''}::${routeType}::${originKey}::${destKey}::${isPanelExpanded}`;
+
+    if (lastFitSignatureRef.current === fitSignature) return;
+    lastFitSignatureRef.current = fitSignature;
+
     map.invalidateSize({ animate: false });
 
     const fitOptions = getRouteFitPadding(isDrifting, isPanelExpanded);
@@ -417,7 +432,195 @@ function MapDestinationClickHandler({ routeType, onMapSetDestination }) {
   return null;
 }
 
-export default function MapView({
+const HIT_TARGET_PATH_OPTIONS = {
+  color: '#000000',
+  weight: 16,
+  opacity: 0,
+  lineCap: 'round',
+  lineJoin: 'round',
+};
+
+const LIVE_INNER_PATH_OPTIONS = {
+  color: '#FAF8F5',
+  weight: 3,
+  fillColor: '#1C1C1E',
+  fillOpacity: 1,
+};
+
+const SecondaryRouteLayer = React.memo(function SecondaryRouteLayer({
+  altRoute,
+  isDark,
+  onSelectRoute,
+}) {
+  const waypoints = altRoute?.waypoints;
+  const routeId = altRoute?.id;
+  const variantIndex = altRoute?.variantIndex;
+  const estimatedMinutes = altRoute?.estimatedMinutes;
+  const distanceKm = altRoute?.distanceKm;
+  const variantLabel = altRoute?.variantLabel;
+
+  const positions = useMemo(
+    () => (Array.isArray(waypoints) && waypoints.length >= 2 ? waypoints : null),
+    [waypoints]
+  );
+
+  const calloutCoord = useMemo(
+    () => (positions ? getRouteCalloutCoord(positions, variantIndex) : null),
+    [positions, variantIndex]
+  );
+
+  const calloutIcon = useMemo(
+    () =>
+      createAlternativeCalloutIcon({
+        altRoute: { estimatedMinutes, distanceKm, variantLabel },
+        isDark,
+      }),
+    [routeId, estimatedMinutes, distanceKm, variantLabel, isDark]
+  );
+
+  const mutedPathOptions = useMemo(
+    () => ({
+      color: isDark ? '#71717A' : '#8E8E93',
+      weight: 4,
+      opacity: isDark ? 0.5 : 0.45,
+      dashArray: '4, 6',
+      lineCap: 'round',
+      lineJoin: 'round',
+    }),
+    [isDark]
+  );
+
+  const eventHandlers = useMemo(
+    () => ({
+      click(e) {
+        if (e?.originalEvent) {
+          L.DomEvent.stopPropagation(e.originalEvent);
+        }
+        if (onSelectRoute && routeId) {
+          onSelectRoute(routeId);
+        }
+      },
+    }),
+    [onSelectRoute, routeId]
+  );
+
+  if (!positions) return null;
+
+  return (
+    <>
+      {/* Visible Muted Alternative Track */}
+      <Polyline
+        positions={positions}
+        interactive={false}
+        pathOptions={mutedPathOptions}
+      />
+
+      {/* Wide Invisible Hit-Target Polyline for Effortless Tap/Click Selection */}
+      <Polyline
+        positions={positions}
+        pathOptions={HIT_TARGET_PATH_OPTIONS}
+        eventHandlers={eventHandlers}
+      />
+
+      {/* Midpoint Floating Duration & Distance Callout Pill */}
+      {calloutCoord && (
+        <Marker
+          position={calloutCoord}
+          icon={calloutIcon}
+          zIndexOffset={120}
+          eventHandlers={eventHandlers}
+        />
+      )}
+    </>
+  );
+});
+
+const NumberedPOIMarker = React.memo(function NumberedPOIMarker({
+  poi,
+  number,
+  idx,
+  isDark,
+  isSelected,
+  isNextStop,
+  isVisited,
+  markerRefs,
+  onSelectPOI,
+}) {
+  const poiId = poi?.id;
+  const poiName = poi?.name;
+  const poiIcon = poi?.icon;
+  const poiColor = poi?.color;
+
+  const badgeIcon = useMemo(
+    () =>
+      createNumberedPOIIcon({
+        number,
+        poi: { name: poiName, icon: poiIcon, color: poiColor },
+        isDark,
+        isSelected,
+        isNextStop,
+        isVisited,
+      }),
+    [poiId, number, poiName, poiIcon, poiColor, isDark, isSelected, isNextStop, isVisited]
+  );
+
+  const setMarkerRef = useCallback(
+    (el) => {
+      if (el && markerRefs?.current && poiId) {
+        markerRefs.current[poiId] = el;
+      }
+    },
+    [markerRefs, poiId]
+  );
+
+  const eventHandlers = useMemo(
+    () => ({
+      click() {
+        if (onSelectPOI) onSelectPOI(poi);
+      },
+    }),
+    [onSelectPOI, poi]
+  );
+
+  return (
+    <Marker
+      ref={setMarkerRef}
+      position={poi.coords}
+      icon={badgeIcon}
+      zIndexOffset={isSelected || isNextStop ? 500 : 300 + idx}
+      eventHandlers={eventHandlers}
+    >
+      <Popup>
+        <div className="text-xs min-w-[190px] max-w-[235px]">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-[#FF6B4A]">
+              Stop 0{number} • {poi.category}
+            </span>
+            <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-[#FF6B4A]/15 text-[#FF6B4A]">
+              {poi.vibeScore}% Vibe
+            </span>
+          </div>
+          <div className="font-editorial font-bold text-sm mt-1">
+            {poi.icon} {poi.name}
+            {isVisited ? ' ✓' : ''}
+          </div>
+          {poi.address && (
+            <div className="text-[11px] font-medium opacity-80 mt-0.5">
+              📍 {poi.address}
+            </div>
+          )}
+          {poi.note && (
+            <div className="text-[11px] italic opacity-75 mt-1.5 border-t border-current/10 pt-1.5">
+              “{poi.note}”
+            </div>
+          )}
+        </div>
+      </Popup>
+    </Marker>
+  );
+});
+
+function MapView({
   theme = 'paper',
   routeType = 'loop',
   origin,
@@ -450,14 +653,29 @@ export default function MapView({
     [routes, route]
   );
   const activeRouteId = selectedRouteId || route?.id;
-  const activeRoute =
-    route ||
-    candidateRoutes.find((r) => r && r.id === activeRouteId) ||
-    candidateRoutes[0] ||
-    null;
-  const secondaryRoutes = isDrifting
-    ? []
-    : candidateRoutes.filter((r) => r && r.id !== activeRouteId);
+  const activeRoute = useMemo(
+    () =>
+      route ||
+      candidateRoutes.find((r) => r && r.id === activeRouteId) ||
+      candidateRoutes[0] ||
+      null,
+    [route, candidateRoutes, activeRouteId]
+  );
+  const secondaryRoutes = useMemo(
+    () =>
+      isDrifting
+        ? []
+        : candidateRoutes.filter((r) => r && r.id !== activeRouteId),
+    [isDrifting, candidateRoutes, activeRouteId]
+  );
+
+  const activeWaypoints = useMemo(
+    () =>
+      Array.isArray(activeRoute?.waypoints) && activeRoute.waypoints.length > 1
+        ? activeRoute.waypoints
+        : null,
+    [activeRoute?.waypoints]
+  );
 
   const tileUrl = hasMapbox
     ? isDark
@@ -473,6 +691,39 @@ export default function MapView({
         ? '#34D399'
         : '#059669'
       : '#FF6B4A';
+
+  const haloPathOptions = useMemo(
+    () => ({
+      color: loopColor,
+      weight: 10,
+      opacity: 0.22,
+      lineCap: 'round',
+      lineJoin: 'round',
+    }),
+    [loopColor]
+  );
+
+  const primaryPathOptions = useMemo(
+    () => ({
+      color: loopColor,
+      weight: 4,
+      opacity: 0.98,
+      dashArray: '6, 8',
+      lineCap: 'round',
+      lineJoin: 'round',
+    }),
+    [loopColor]
+  );
+
+  const liveOuterPathOptions = useMemo(
+    () => ({
+      color: loopColor,
+      weight: 1.5,
+      fillColor: loopColor,
+      fillOpacity: 0.22,
+    }),
+    [loopColor]
+  );
 
   const handleFitRoute = useCallback(() => {
     const map = mapInstanceRef.current;
@@ -532,19 +783,27 @@ export default function MapView({
     if (map) map.zoomOut();
   }, []);
 
-  const startBadgeIcon = createTerminalBadgeIcon({
-    letter: 'A',
-    subtitle: routeType === 'pointToPoint' ? 'Start' : 'Loop Start',
-    isDark,
-    isDestination: false,
-  });
+  const startBadgeIcon = useMemo(
+    () =>
+      createTerminalBadgeIcon({
+        letter: 'A',
+        subtitle: routeType === 'pointToPoint' ? 'Start' : 'Loop Start',
+        isDark,
+        isDestination: false,
+      }),
+    [routeType, isDark]
+  );
 
-  const destinationBadgeIcon = createTerminalBadgeIcon({
-    letter: 'B',
-    subtitle: 'Finish',
-    isDark,
-    isDestination: true,
-  });
+  const destinationBadgeIcon = useMemo(
+    () =>
+      createTerminalBadgeIcon({
+        letter: 'B',
+        subtitle: 'Finish',
+        isDark,
+        isDestination: true,
+      }),
+    [isDark]
+  );
 
   return (
     <div
@@ -556,14 +815,25 @@ export default function MapView({
         center={origin}
         zoom={15}
         zoomControl={false}
+        fadeAnimation={false}
+        markerZoomAnimation={true}
+        preferCanvas={true}
+        zoomSnap={0.5}
+        zoomDelta={0.5}
+        wheelPxPerZoomLevel={80}
         className="w-full h-full z-0"
       >
         <TileLayer
-          key={`${theme}-${hasMapbox ? 'mapbox-v12' : 'fallback'}`}
+          key={`${theme}-${hasMapbox ? 'mapbox-512' : 'fallback'}`}
           url={tileUrl}
           attribution={MAPBOX_ATTRIBUTION}
           tileSize={hasMapbox ? 512 : 256}
           zoomOffset={hasMapbox ? -1 : 0}
+          detectRetina={false}
+          keepBuffer={8}
+          updateWhenIdle={false}
+          updateWhenZooming={false}
+          maxNativeZoom={18}
           maxZoom={20}
         />
 
@@ -589,98 +859,28 @@ export default function MapView({
         )}
 
         {/* Secondary Alternative Routes (Muted Interactive Paths + Midpoint Duration/Distance Pills) */}
-        {secondaryRoutes.map((altRoute) => {
-          if (!altRoute?.waypoints || altRoute.waypoints.length < 2) return null;
-          const calloutCoord = getRouteCalloutCoord(
-            altRoute.waypoints,
-            altRoute.variantIndex
-          );
-          const calloutIcon = createAlternativeCalloutIcon({
-            altRoute,
-            isDark,
-          });
-
-          const handleSelectAlt = (e) => {
-            if (e?.originalEvent) {
-              L.DomEvent.stopPropagation(e.originalEvent);
-            }
-            if (onSelectRoute) {
-              onSelectRoute(altRoute.id);
-            }
-          };
-
-          return (
-            <React.Fragment key={altRoute.id}>
-              {/* Visible Muted Alternative Track */}
-              <Polyline
-                positions={altRoute.waypoints}
-                interactive={false}
-                pathOptions={{
-                  color: isDark ? '#71717A' : '#8E8E93',
-                  weight: 4,
-                  opacity: isDark ? 0.5 : 0.45,
-                  dashArray: '4, 6',
-                  lineCap: 'round',
-                  lineJoin: 'round',
-                }}
-              />
-
-              {/* Wide Invisible Hit-Target Polyline for Effortless Tap/Click Selection */}
-              <Polyline
-                positions={altRoute.waypoints}
-                pathOptions={{
-                  color: '#000000',
-                  weight: 16,
-                  opacity: 0,
-                  lineCap: 'round',
-                  lineJoin: 'round',
-                }}
-                eventHandlers={{
-                  click: handleSelectAlt,
-                }}
-              />
-
-              {/* Midpoint Floating Duration & Distance Callout Pill */}
-              {calloutCoord && (
-                <Marker
-                  position={calloutCoord}
-                  icon={calloutIcon}
-                  zIndexOffset={120}
-                  eventHandlers={{
-                    click: handleSelectAlt,
-                  }}
-                />
-              )}
-            </React.Fragment>
-          );
-        })}
+        {secondaryRoutes.map((altRoute) => (
+          <SecondaryRouteLayer
+            key={altRoute.id}
+            altRoute={altRoute}
+            isDark={isDark}
+            onSelectRoute={onSelectRoute}
+          />
+        ))}
 
         {/* Layer 1: Soft Translucent Underglow / Halo along the Active Street Route */}
-        {route?.waypoints && (
+        {activeWaypoints && (
           <Polyline
-            positions={route.waypoints}
-            pathOptions={{
-              color: loopColor,
-              weight: 10,
-              opacity: 0.22,
-              lineCap: 'round',
-              lineJoin: 'round',
-            }}
+            positions={activeWaypoints}
+            pathOptions={haloPathOptions}
           />
         )}
 
         {/* Layer 2: Crisp Dashed Primary Editorial Route Stroke */}
-        {route?.waypoints && (
+        {activeWaypoints && (
           <Polyline
-            positions={route.waypoints}
-            pathOptions={{
-              color: loopColor,
-              weight: 4,
-              opacity: 0.98,
-              dashArray: '6, 8',
-              lineCap: 'round',
-              lineJoin: 'round',
-            }}
+            positions={activeWaypoints}
+            pathOptions={primaryPathOptions}
           />
         )}
 
@@ -726,65 +926,20 @@ export default function MapView({
         )}
 
         {/* Real-World Curated Micro-POI Numbered Editorial Badges ('1', '2', '3', '4') */}
-        {route?.pois?.map((poi, idx) => {
-          const isSelected = selectedPOI?.id === poi.id;
-          const isNextStop = isDrifting && nextStop?.id === poi.id;
-          const isVisited = isDrifting && visitedStopIds.includes(poi.id);
-          const number = idx + 1;
-
-          const badgeIcon = createNumberedPOIIcon({
-            number,
-            poi,
-            isDark,
-            isSelected,
-            isNextStop,
-            isVisited,
-          });
-
-          return (
-            <Marker
-              key={poi.id}
-              ref={(el) => {
-                if (el) {
-                  markerRefs.current[poi.id] = el;
-                }
-              }}
-              position={poi.coords}
-              icon={badgeIcon}
-              zIndexOffset={isSelected || isNextStop ? 500 : 300 + idx}
-              eventHandlers={{
-                click: () => onSelectPOI && onSelectPOI(poi),
-              }}
-            >
-              <Popup>
-                <div className="text-xs min-w-[190px] max-w-[235px]">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-[10px] font-bold uppercase tracking-wider text-[#FF6B4A]">
-                      Stop 0{number} • {poi.category}
-                    </span>
-                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-[#FF6B4A]/15 text-[#FF6B4A]">
-                      {poi.vibeScore}% Vibe
-                    </span>
-                  </div>
-                  <div className="font-editorial font-bold text-sm mt-1">
-                    {poi.icon} {poi.name}
-                    {isVisited ? ' ✓' : ''}
-                  </div>
-                  {poi.address && (
-                    <div className="text-[11px] font-medium opacity-80 mt-0.5">
-                      📍 {poi.address}
-                    </div>
-                  )}
-                  {poi.note && (
-                    <div className="text-[11px] italic opacity-75 mt-1.5 border-t border-current/10 pt-1.5">
-                      “{poi.note}”
-                    </div>
-                  )}
-                </div>
-              </Popup>
-            </Marker>
-          );
-        })}
+        {activeRoute?.pois?.map((poi, idx) => (
+          <NumberedPOIMarker
+            key={poi.id}
+            poi={poi}
+            number={idx + 1}
+            idx={idx}
+            isDark={isDark}
+            isSelected={selectedPOI?.id === poi.id}
+            isNextStop={isDrifting && nextStop?.id === poi.id}
+            isVisited={isDrifting && visitedStopIds.includes(poi.id)}
+            markerRefs={markerRefs}
+            onSelectPOI={onSelectPOI}
+          />
+        ))}
 
         {/* Live Pulsing User GPS Beacon (during Active Drift mode) */}
         {isDrifting && livePosition && (
@@ -792,22 +947,12 @@ export default function MapView({
             <CircleMarker
               center={livePosition}
               radius={18}
-              pathOptions={{
-                color: loopColor,
-                weight: 1.5,
-                fillColor: loopColor,
-                fillOpacity: 0.22,
-              }}
+              pathOptions={liveOuterPathOptions}
             />
             <CircleMarker
               center={livePosition}
               radius={7.5}
-              pathOptions={{
-                color: '#FAF8F5',
-                weight: 3,
-                fillColor: '#1C1C1E',
-                fillOpacity: 1,
-              }}
+              pathOptions={LIVE_INNER_PATH_OPTIONS}
             >
               <Popup>
                 <div className="text-xs font-bold">
@@ -833,10 +978,10 @@ export default function MapView({
       {/* Minimalist Floating Map Utility Controls (Top-Right Editorial Pill) */}
       <aside
         aria-label="Map Viewport Controls"
-        className={`pointer-events-auto absolute top-16 right-4 md:right-6 z-10 flex flex-col items-center rounded-full border backdrop-blur-md overflow-hidden transition-colors ${
+        className={`pointer-events-auto transform-gpu will-change-transform absolute top-16 right-4 md:right-6 z-10 flex flex-col items-center rounded-full border overflow-hidden transition-colors ${
           isDark
-            ? 'bg-[#18181B]/90 border-white/15 text-[#F4F1EA] shadow-lg shadow-black/40'
-            : 'bg-[#FAF8F5]/95 border-[#1C1C1E]/15 text-[#1C1C1E] shadow-[0_6px_24px_rgba(28,28,30,0.1)]'
+            ? 'bg-[#18181B]/[0.96] border-white/15 text-[#F4F1EA] shadow-lg shadow-black/40'
+            : 'bg-[#F4F1EA]/[0.96] border-[#1C1C1E]/15 text-[#1C1C1E] shadow-[0_6px_24px_rgba(28,28,30,0.1)]'
         }`}
       >
         <button
@@ -888,3 +1033,5 @@ export default function MapView({
     </div>
   );
 }
+
+export default React.memo(MapView);

@@ -373,13 +373,13 @@ export default function App() {
     );
   };
 
-  const handleMapSetDestination = (coords) => {
+  const handleMapSetDestination = useCallback((coords) => {
     setSelectedPOI(null);
     setDestination(coords);
     setDestinationLabel(
       `Dropped Pin (${coords[0].toFixed(4)}, ${coords[1].toFixed(4)})`
     );
-  };
+  }, []);
 
   const toggleTheme = () => {
     setTheme((prev) => (prev === 'paper' ? 'dark' : 'paper'));
@@ -394,10 +394,10 @@ export default function App() {
       {/* Top Floating Editorial Masthead & Theme / GPS Controls */}
       <header className="pointer-events-none absolute top-3.5 inset-x-0 z-20 px-4 flex items-center justify-between max-w-md mx-auto md:max-w-none md:px-6">
         <div
-          className={`pointer-events-auto flex items-center gap-2.5 px-4 py-2 rounded-full backdrop-blur-md border transition-colors ${
+          className={`pointer-events-auto transform-gpu will-change-transform flex items-center gap-2.5 px-4 py-2 rounded-full border transition-colors ${
             isDark
-              ? 'bg-[#18181B]/90 border-white/15 text-[#F4F1EA] shadow-lg shadow-black/30'
-              : 'bg-[#FAF8F5]/95 border-[#1C1C1E]/15 text-[#1C1C1E] shadow-[0_4px_20px_rgba(28,28,30,0.08)]'
+              ? 'bg-[#18181B]/[0.96] border-white/15 text-[#F4F1EA] shadow-lg shadow-black/30'
+              : 'bg-[#F4F1EA]/[0.96] border-[#1C1C1E]/15 text-[#1C1C1E] shadow-[0_4px_20px_rgba(28,28,30,0.08)]'
           }`}
         >
           <span
@@ -430,10 +430,10 @@ export default function App() {
           <button
             type="button"
             onClick={toggleTheme}
-            className={`p-2.5 rounded-full backdrop-blur-md border transition active:scale-95 ${
+            className={`transform-gpu will-change-transform p-2.5 rounded-full border transition active:scale-95 ${
               isDark
-                ? 'bg-[#18181B]/90 border-white/15 text-amber-300 hover:border-amber-400/50 shadow-lg'
-                : 'bg-[#FAF8F5]/95 border-[#1C1C1E]/15 text-[#1C1C1E] hover:text-[#FF6B4A] shadow-[0_4px_20px_rgba(28,28,30,0.08)]'
+                ? 'bg-[#18181B]/[0.96] border-white/15 text-amber-300 hover:border-amber-400/50 shadow-lg'
+                : 'bg-[#F4F1EA]/[0.96] border-[#1C1C1E]/15 text-[#1C1C1E] hover:text-[#FF6B4A] shadow-[0_4px_20px_rgba(28,28,30,0.08)]'
             }`}
             title={
               isDark
@@ -448,10 +448,10 @@ export default function App() {
           <button
             type="button"
             onClick={requestUserLocation}
-            className={`p-2.5 rounded-full backdrop-blur-md border transition active:scale-95 ${
+            className={`transform-gpu will-change-transform p-2.5 rounded-full border transition active:scale-95 ${
               isDark
-                ? 'bg-[#18181B]/90 border-white/15 text-stone-200 hover:text-[#FF6B4A] shadow-lg'
-                : 'bg-[#FAF8F5]/95 border-[#1C1C1E]/15 text-[#1C1C1E] hover:text-[#FF6B4A] shadow-[0_4px_20px_rgba(28,28,30,0.08)]'
+                ? 'bg-[#18181B]/[0.96] border-white/15 text-stone-200 hover:text-[#FF6B4A] shadow-lg'
+                : 'bg-[#F4F1EA]/[0.96] border-[#1C1C1E]/15 text-[#1C1C1E] hover:text-[#FF6B4A] shadow-[0_4px_20px_rgba(28,28,30,0.08)]'
             }`}
             title="Center on current GPS"
             aria-label="Center on current GPS"
@@ -469,10 +469,10 @@ export default function App() {
       {toastMessage && (
         <div className="pointer-events-none absolute top-16 left-1/2 -translate-x-1/2 z-30 w-max max-w-[90vw]">
           <div
-            className={`px-3.5 py-2 rounded-full border text-xs font-semibold flex items-center gap-2 shadow-xl backdrop-blur-md ${
+            className={`transform-gpu will-change-transform px-3.5 py-2 rounded-full border text-xs font-semibold flex items-center gap-2 shadow-xl ${
               isDark
-                ? 'bg-[#202024]/95 border-emerald-400/35 text-[#F4F1EA]'
-                : 'bg-[#1C1C1E]/95 border-[#1C1C1E] text-[#F4F1EA]'
+                ? 'bg-[#18181B]/[0.96] border-emerald-400/35 text-[#F4F1EA]'
+                : 'bg-[#1C1C1E]/[0.96] border-[#1C1C1E] text-[#F4F1EA]'
             }`}
           >
             <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0" />

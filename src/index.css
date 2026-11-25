@@ -12,33 +12,21 @@
   }
 }
 
-/* Tactile Paper & Ink Cartographic Filters */
-.map-tiles-paper .leaflet-tile-pane {
-  filter: sepia(0.18) contrast(0.96) brightness(1.01) saturate(0.85);
-  transition: filter 0.3s ease;
-}
-
-.map-tiles-dark .leaflet-tile-pane {
-  filter: contrast(1.06) brightness(0.92) saturate(0.85);
-  transition: filter 0.3s ease;
-}
-
 /* Custom Editorial Numbered & Terminal DivIcon Markers */
 .stray-editorial-marker {
   background: transparent !important;
   border: none !important;
 }
 
-/* Editorial Paper & Ink Leaflet Popups */
+/* Editorial Paper & Ink Leaflet Popups (solid high-opacity, zero backdrop-blur) */
 .leaflet-popup-content-wrapper {
   border-radius: 16px !important;
   padding: 2px 4px !important;
   font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif !important;
-  background: rgba(244, 241, 234, 0.96) !important;
+  background: rgba(244, 241, 234, 0.97) !important;
   color: #1C1C1E !important;
   border: 1px solid rgba(28, 28, 30, 0.14) !important;
   box-shadow: 0 12px 32px rgba(28, 28, 30, 0.16) !important;
-  backdrop-filter: blur(12px);
 }
 
 .leaflet-popup-tip {
@@ -88,8 +76,7 @@
   padding: 2px 8px !important;
   border-radius: 9999px !important;
   margin: 0 8px 6px 0 !important;
-  backdrop-filter: blur(8px);
-  background: rgba(244, 241, 234, 0.85) !important;
+  background: rgba(244, 241, 234, 0.94) !important;
   color: rgba(28, 28, 30, 0.65) !important;
   border: 1px solid rgba(28, 28, 30, 0.1) !important;
 }
@@ -101,7 +88,7 @@
 }
 
 .map-tiles-dark .leaflet-control-attribution {
-  background: rgba(24, 24, 27, 0.85) !important;
+  background: rgba(24, 24, 27, 0.94) !important;
   color: rgba(244, 241, 234, 0.55) !important;
   border: 1px solid rgba(255, 255, 255, 0.1) !important;
 }

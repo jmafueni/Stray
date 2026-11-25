@@ -44,13 +44,13 @@ export default function ActiveDriftHUD({
   const isRun = route?.activityMode === 'run';
 
   return (
-    <div className="pointer-events-none absolute bottom-3 sm:bottom-4 left-1/2 -translate-x-1/2 z-20 w-[calc(100%-1.5rem)] max-w-md">
+    <div className="pointer-events-none absolute bottom-3 sm:bottom-4 left-1/2 -translate-x-1/2 z-20 w-[calc(100%-1.5rem)] max-w-md transform-gpu will-change-transform">
       <section
         aria-label="Active Drift Live HUD"
-        className={`pointer-events-auto w-full backdrop-blur-xl border rounded-3xl p-4 sm:p-5 shadow-2xl transition-colors duration-300 ${
+        className={`pointer-events-auto w-full transform-gpu will-change-transform border rounded-3xl p-4 sm:p-5 shadow-2xl transition-colors duration-300 ${
           isDark
-            ? 'bg-[#18181B]/95 border-white/15 text-[#F4F1EA] shadow-black/80'
-            : 'bg-[#F4F1EA]/95 border-[#1C1C1E]/15 text-[#1C1C1E] shadow-[0_16px_48px_rgba(28,28,30,0.22)]'
+            ? 'bg-[#18181B]/[0.96] border-white/15 text-[#F4F1EA] shadow-black/80'
+            : 'bg-[#F4F1EA]/[0.96] border-[#1C1C1E]/15 text-[#1C1C1E] shadow-[0_16px_48px_rgba(28,28,30,0.22)]'
         }`}
       >
         {/* Top Status Row: Live Beacon + Simulate Toggle + Cancel */}
