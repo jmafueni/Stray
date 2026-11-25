@@ -1,5 +1,5 @@
 // src/components/MapView.jsx
-import React, { useEffect, useRef, useCallback } from 'react';
+import React, { useEffect, useRef, useCallback, useMemo } from 'react';
 import L from 'leaflet';
 import {
   MapContainer,
@@ -201,11 +201,14 @@ function getRouteCalloutCoord(waypoints = [], variantIndex = 1) {
 }
 
 /**
- * Computes responsive Leaflet `fitBounds` padding options so the active route and
- * all numbered POI markers frame cleanly in the unobstructed upper viewport above
- * the floating bottom sheet (`ControlPanel` or compact `ActiveDriftHUD`).
+ * Computes responsive Leaflet `fitBounds` padding options so all route alternatives
+ * and numbered POI markers frame cleanly in the unobstructed map canvas beside the
+ * desktop left-docked panel or above the mobile floating bottom bar/sheet.
  */
-export function getRouteFitPadding(isDriftActive = false) {
+export function getRouteFitPadding(
+  isDriftActive = false,
+  isPanelExpanded = true
+) {
   const width = typeof window !== 'undefined' ? window.innerWidth : 1024;
   const height = typeof window !== 'undefined' ? window.innerHeight : 768;
 
@@ -219,19 +222,25 @@ export function getRouteFitPadding(isDriftActive = false) {
     };
   }
 
-  if (width < 640) {
+  // Desktop (>= 768px): asymmetric left padding for the left-docked ControlPanel (w-[410px] + left-6)
+  if (width >= 768) {
     return {
-      paddingTopLeft: [36, 84],
-      paddingBottomRight: [36, Math.min(440, Math.round(height * 0.54))],
+      paddingTopLeft: [450, 84],
+      paddingBottomRight: [56, 56],
       maxZoom: 16,
       animate: true,
       duration: 0.65,
     };
   }
 
+  // Mobile (< 768px): minimal bottom padding (190px) when collapsed, 380px when expanded
+  const mobileBottomPadding = isPanelExpanded
+    ? Math.min(380, Math.max(190, height - 180))
+    : Math.min(190, Math.max(120, height - 180));
+
   return {
-    paddingTopLeft: [64, 92],
-    paddingBottomRight: [64, Math.min(430, Math.round(height * 0.48))],
+    paddingTopLeft: [32, 80],
+    paddingBottomRight: [32, mobileBottomPadding],
     maxZoom: 16,
     animate: true,
     duration: 0.65,
@@ -248,20 +257,32 @@ function isValidLatLng(coord) {
 }
 
 /**
- * Collects all coordinates for the active route (waypoints + POI markers + start/finish anchors)
- * so Leaflet `fitBounds` keeps the entire path and every numbered stop marker in view.
+ * Collects coordinates across all visible route alternatives (all 3 petals when browsing,
+ * or the active route when drifting), plus numbered POI markers and start/finish anchors,
+ * so Leaflet `fitBounds` frames every route petal without requiring manual panning.
  */
-function getActiveRouteBoundsPoints({
+function getRouteBoundsPoints({
   activeRoute,
+  routes = [],
   origin,
   destination,
   routeType,
+  isDrifting = false,
 }) {
   const points = [];
 
-  if (Array.isArray(activeRoute?.waypoints)) {
-    for (const wp of activeRoute.waypoints) {
-      if (isValidLatLng(wp)) points.push(wp);
+  const routesToFrame =
+    !isDrifting && Array.isArray(routes) && routes.length > 0
+      ? routes
+      : activeRoute
+      ? [activeRoute]
+      : [];
+
+  for (const r of routesToFrame) {
+    if (Array.isArray(r?.waypoints)) {
+      for (const wp of r.waypoints) {
+        if (isValidLatLng(wp)) points.push(wp);
+      }
     }
   }
 
@@ -287,9 +308,11 @@ function MapViewportUpdater({
   destination,
   routeType,
   activeRoute,
+  candidateRoutes,
   selectedPOI,
   markerRefs,
   isDrifting,
+  isPanelExpanded,
   livePosition,
   mapInstanceRef,
 }) {
@@ -316,17 +339,19 @@ function MapViewportUpdater({
     };
   }, [map]);
 
-  // Fit bounds with dynamic viewport-aware bottom padding so the active route and its POIs sit cleanly above the bottom sheet
+  // Fit bounds with responsive asymmetric padding so all 3 route petals & POIs sit cleanly in the unobstructed map canvas
   useEffect(() => {
     if (selectedPOI?.coords || isDrifting) return;
     map.invalidateSize({ animate: false });
 
-    const fitOptions = getRouteFitPadding(isDrifting);
-    const boundsPoints = getActiveRouteBoundsPoints({
+    const fitOptions = getRouteFitPadding(isDrifting, isPanelExpanded);
+    const boundsPoints = getRouteBoundsPoints({
       activeRoute,
+      routes: candidateRoutes,
       origin,
       destination,
       routeType,
+      isDrifting,
     });
 
     if (boundsPoints.length > 1) {
@@ -336,7 +361,17 @@ function MapViewportUpdater({
     } else if (isValidLatLng(origin)) {
       map.setView(origin, 15);
     }
-  }, [map, origin, destination, routeType, activeRoute, selectedPOI, isDrifting]);
+  }, [
+    map,
+    origin,
+    destination,
+    routeType,
+    activeRoute,
+    candidateRoutes,
+    selectedPOI,
+    isDrifting,
+    isPanelExpanded,
+  ]);
 
   // Follow live user GPS beacon during Active Drift
   useEffect(() => {
@@ -395,6 +430,7 @@ export default function MapView({
   onSelectPOI,
   onMapSetDestination,
   isDrifting = false,
+  isPanelExpanded = true,
   livePosition = null,
   nextStop = null,
   visitedStopIds = [],
@@ -404,12 +440,15 @@ export default function MapView({
   const isDark = theme === 'dark';
   const hasMapbox = Boolean(MAPBOX_TOKEN);
 
-  const candidateRoutes =
-    Array.isArray(routes) && routes.length > 0
-      ? routes
-      : route
-      ? [route]
-      : [];
+  const candidateRoutes = useMemo(
+    () =>
+      Array.isArray(routes) && routes.length > 0
+        ? routes
+        : route
+        ? [route]
+        : [],
+    [routes, route]
+  );
   const activeRouteId = selectedRouteId || route?.id;
   const activeRoute =
     route ||
@@ -442,12 +481,14 @@ export default function MapView({
     map.closePopup();
     map.invalidateSize({ animate: false });
 
-    const fitOptions = getRouteFitPadding(isDrifting);
-    const boundsPoints = getActiveRouteBoundsPoints({
+    const fitOptions = getRouteFitPadding(isDrifting, isPanelExpanded);
+    const boundsPoints = getRouteBoundsPoints({
       activeRoute,
+      routes: candidateRoutes,
       origin,
       destination,
       routeType,
+      isDrifting,
     });
 
     if (boundsPoints.length > 1) {
@@ -461,7 +502,16 @@ export default function MapView({
     } else if (isValidLatLng(origin)) {
       map.flyTo(origin, 15, { duration: 0.65 });
     }
-  }, [activeRoute, isDrifting, routeType, origin, destination, onSelectPOI]);
+  }, [
+    activeRoute,
+    candidateRoutes,
+    isDrifting,
+    isPanelExpanded,
+    routeType,
+    origin,
+    destination,
+    onSelectPOI,
+  ]);
 
   const handleCenterOnMe = useCallback(() => {
     const map = mapInstanceRef.current;
@@ -522,9 +572,11 @@ export default function MapView({
           destination={destination}
           routeType={routeType}
           activeRoute={activeRoute}
+          candidateRoutes={candidateRoutes}
           selectedPOI={selectedPOI}
           markerRefs={markerRefs}
           isDrifting={isDrifting}
+          isPanelExpanded={isPanelExpanded}
           livePosition={livePosition}
           mapInstanceRef={mapInstanceRef}
         />
@@ -781,7 +833,7 @@ export default function MapView({
       {/* Minimalist Floating Map Utility Controls (Top-Right Editorial Pill) */}
       <aside
         aria-label="Map Viewport Controls"
-        className={`pointer-events-auto absolute top-16 right-4 z-10 flex flex-col items-center rounded-full border backdrop-blur-md overflow-hidden transition-colors ${
+        className={`pointer-events-auto absolute top-16 right-4 md:right-6 z-10 flex flex-col items-center rounded-full border backdrop-blur-md overflow-hidden transition-colors ${
           isDark
             ? 'bg-[#18181B]/90 border-white/15 text-[#F4F1EA] shadow-lg shadow-black/40'
             : 'bg-[#FAF8F5]/95 border-[#1C1C1E]/15 text-[#1C1C1E] shadow-[0_6px_24px_rgba(28,28,30,0.1)]'

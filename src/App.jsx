@@ -38,6 +38,7 @@ export default function App() {
   const [selectedPOI, setSelectedPOI] = useState(null);
   const [locating, setLocating] = useState(false);
   const [isRouting, setIsRouting] = useState(false);
+  const [isPanelExpanded, setIsPanelExpanded] = useState(true);
 
   // Persistent Drift & POI Memory State
   const [driftHistory, setDriftHistory] = useState(() => loadDriftHistory());
@@ -257,6 +258,7 @@ export default function App() {
 
   const handleRegenerate = () => {
     setSelectedPOI(null);
+    setIsPanelExpanded(false);
     setSeed((prev) => prev + 1);
   };
 
@@ -268,12 +270,14 @@ export default function App() {
     setRouteType('loop');
     setActivityMode(presetActivity);
     setSteps(presetSteps);
+    setIsPanelExpanded(false);
     setSeed((prev) => prev + 1);
   };
 
   const handleSelectRoute = useCallback((routeId) => {
     setSelectedPOI(null);
     setSelectedRouteId(routeId);
+    setIsPanelExpanded(false);
   }, []);
 
   const handleLoadSavedRoute = (savedRoute) => {
@@ -295,6 +299,7 @@ export default function App() {
     };
     setRouteAlternatives([hydratedRoute]);
     setSelectedRouteId(hydratedRoute.id);
+    setIsPanelExpanded(false);
     showToast(`Loaded "${savedRoute.title}" onto map`);
   };
 
@@ -387,7 +392,7 @@ export default function App() {
       }`}
     >
       {/* Top Floating Editorial Masthead & Theme / GPS Controls */}
-      <header className="pointer-events-none absolute top-3.5 inset-x-0 z-20 px-4 flex items-center justify-between max-w-md mx-auto">
+      <header className="pointer-events-none absolute top-3.5 inset-x-0 z-20 px-4 flex items-center justify-between max-w-md mx-auto md:max-w-none md:px-6">
         <div
           className={`pointer-events-auto flex items-center gap-2.5 px-4 py-2 rounded-full backdrop-blur-md border transition-colors ${
             isDark
@@ -490,6 +495,7 @@ export default function App() {
         onSelectPOI={setSelectedPOI}
         onMapSetDestination={handleMapSetDestination}
         isDrifting={isDrifting}
+        isPanelExpanded={isPanelExpanded}
         livePosition={livePosition}
         nextStop={nextStop}
         visitedStopIds={visitedStopIds}
@@ -519,6 +525,8 @@ export default function App() {
       ) : (
         <ControlPanel
           theme={theme}
+          isPanelExpanded={isPanelExpanded}
+          onTogglePanelExpanded={() => setIsPanelExpanded((prev) => !prev)}
           origin={origin}
           routeType={routeType}
           setRouteType={setRouteType}

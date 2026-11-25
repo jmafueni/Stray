@@ -24,6 +24,9 @@ import {
   CheckCircle2,
   Utensils,
   Coffee,
+  SlidersHorizontal,
+  ChevronDown,
+  Map,
 } from 'lucide-react';
 import {
   stepsToKm,
@@ -37,6 +40,8 @@ import POICard from './POICard';
 
 export default function ControlPanel({
   theme = 'paper',
+  isPanelExpanded = true,
+  onTogglePanelExpanded,
   origin,
   routeType = 'loop',
   setRouteType,
@@ -91,6 +96,12 @@ export default function ControlPanel({
   const displayDistanceKm = route?.distanceKm || stepsToKm(steps, activityMode);
   const displaySteps = route?.steps || steps;
   const targetMinutes = stepsToMinutes(steps, activityMode);
+  const summaryMinutes =
+    routeType === 'loop'
+      ? targetMinutes
+      : route?.estimatedMinutes || targetMinutes;
+  const activityLabel = activityMode === 'run' ? 'Run' : 'Walk';
+  const routeShapeLabel = routeType === 'pointToPoint' ? 'A→B' : 'Loop';
   const DURATION_PILLS = [15, 30, 45, 60];
 
   // Keep search input synchronized when user taps on the map to drop Point B
@@ -144,21 +155,253 @@ export default function ControlPanel({
   };
 
   return (
-    <div className="pointer-events-none absolute bottom-3 sm:bottom-4 left-1/2 -translate-x-1/2 z-20 w-[calc(100%-1.5rem)] max-w-md">
+    <div
+      className={`pointer-events-none absolute bottom-4 inset-x-3 z-20 mx-auto transition-all duration-300 md:inset-x-auto md:left-6 md:bottom-6 md:mx-0 md:w-[410px] md:max-w-[410px] ${
+        isPanelExpanded ? 'max-w-md' : 'max-w-2xl'
+      }`}
+    >
       <section
         aria-label="Stray Route Controls"
-        className={`pointer-events-auto w-full backdrop-blur-xl border rounded-3xl p-4 sm:p-5 shadow-2xl transition-colors duration-300 ${
+        className={`pointer-events-auto w-full backdrop-blur-xl border rounded-3xl shadow-2xl transition-all duration-300 ${
+          isPanelExpanded
+            ? 'p-4 sm:p-5 max-h-[calc(100dvh-5.5rem)] overflow-y-auto no-scrollbar'
+            : 'p-3 sm:p-3.5'
+        } ${
           isDark
             ? 'bg-[#18181B]/95 border-white/15 text-[#F4F1EA] shadow-black/70'
             : 'bg-[#F4F1EA]/95 border-[#1C1C1E]/15 text-[#1C1C1E] shadow-[0_16px_48px_rgba(28,28,30,0.18)]'
         }`}
       >
-      {/* Grab Handle for Mobile Sheet */}
-      <div
-        className={`w-10 h-1 rounded-full mx-auto mb-3 sm:hidden ${
-          isDark ? 'bg-white/20' : 'bg-[#1C1C1E]/20'
-        }`}
-      />
+        {!isPanelExpanded ? (
+          /* COLLAPSED COMPACT ROUTE BAR MODE */
+          <div className="space-y-2 transition-all duration-300">
+            {/* Top Row: Active Mode Summary Pill + Edit Drift + Spin */}
+            <div className="flex items-center justify-between gap-1.5">
+              <button
+                type="button"
+                onClick={() => onTogglePanelExpanded && onTogglePanelExpanded()}
+                title="Expand drift controls"
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-full border text-[11px] font-semibold min-w-0 transition ${
+                  isDark
+                    ? 'bg-[#202024] border-white/12 text-[#F4F1EA] hover:border-white/25'
+                    : 'bg-[#FAF8F5] border-[#1C1C1E]/12 text-[#1C1C1E] hover:border-[#1C1C1E]/30 shadow-sm'
+                }`}
+              >
+                {activityMode === 'run' ? (
+                  <Zap className="w-3 h-3 text-emerald-500 flex-shrink-0" />
+                ) : (
+                  <Footprints className="w-3 h-3 text-[#FF6B4A] flex-shrink-0" />
+                )}
+                <span className="truncate">
+                  {activityLabel} • {summaryMinutes} min • {routeShapeLabel}
+                </span>
+                {isRouting && (
+                  <Loader2 className="w-3 h-3 animate-spin text-[#FF6B4A] flex-shrink-0" />
+                )}
+              </button>
+
+              <div className="flex items-center gap-1.5 flex-shrink-0">
+                <button
+                  type="button"
+                  onClick={() => onTogglePanelExpanded && onTogglePanelExpanded()}
+                  aria-label="Edit Drift"
+                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-[11px] font-semibold transition active:scale-95 ${
+                    isDark
+                      ? 'bg-[#202024] border-white/15 text-[#F4F1EA] hover:border-[#FF6B4A]/60 hover:text-[#FF6B4A]'
+                      : 'bg-[#FAF8F5] border-[#1C1C1E]/15 text-[#1C1C1E] hover:border-[#FF6B4A]/60 hover:text-[#FF6B4A] shadow-sm'
+                  }`}
+                >
+                  <SlidersHorizontal className="w-3 h-3 text-[#FF6B4A]" />
+                  <span>Edit Drift</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={onRegenerate}
+                  title={
+                    routeType === 'pointToPoint'
+                      ? 'Spin alternative side-street corridor between A and B'
+                      : 'Spin a fresh street loop direction'
+                  }
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-[#FF6B4A] hover:bg-[#e85d3d] active:scale-95 text-white font-semibold text-[11px] shadow-md shadow-[#FF6B4A]/25 transition"
+                >
+                  <Shuffle
+                    className={`w-3 h-3 ${isRouting ? 'animate-spin' : ''}`}
+                  />
+                  <span>Spin</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Middle Row: 3 Compact Route Variant Selector Pills */}
+            {routes.length > 0 && (
+              <div
+                role="radiogroup"
+                aria-label="Route Alternatives"
+                className={`grid gap-1.5 ${
+                  routes.length === 1 ? 'grid-cols-1' : 'grid-cols-3'
+                }`}
+              >
+                {routes.slice(0, 3).map((candidate, idx) => {
+                  const isSelected =
+                    (selectedRouteId && candidate.id === selectedRouteId) ||
+                    (!selectedRouteId && idx === 0);
+                  const label =
+                    candidate.variantLabel ||
+                    (idx === 0
+                      ? 'Curated Drift'
+                      : idx === 1
+                      ? 'Quiet Alleys'
+                      : 'Hidden Gems');
+
+                  return (
+                    <button
+                      key={candidate.id || idx}
+                      type="button"
+                      role="radio"
+                      aria-checked={isSelected}
+                      onClick={() => onSelectRoute && onSelectRoute(candidate.id)}
+                      className={`text-left px-2.5 py-1.5 rounded-2xl border transition-all ${
+                        isSelected
+                          ? isDark
+                            ? 'bg-[#26262C] border-[#FF6B4A] ring-1 ring-[#FF6B4A]/35 shadow-sm'
+                            : 'bg-[#FAF8F5] border-[#FF6B4A] ring-1 ring-[#FF6B4A]/35 shadow-[0_4px_14px_rgba(255,107,74,0.14)]'
+                          : isDark
+                          ? 'bg-[#202024]/75 border-white/10 text-stone-400 hover:border-white/25 hover:text-stone-200'
+                          : 'bg-[#EAE5DB]/60 border-[#1C1C1E]/10 text-stone-600 hover:border-[#1C1C1E]/25 hover:text-[#1C1C1E]'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-1">
+                        <span
+                          className={`font-editorial text-[11px] font-bold truncate ${
+                            isSelected
+                              ? 'text-[#FF6B4A]'
+                              : isDark
+                              ? 'text-[#F4F1EA]'
+                              : 'text-[#1C1C1E]'
+                          }`}
+                        >
+                          {label}
+                        </span>
+                        <span
+                          className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                            isSelected
+                              ? 'bg-[#FF6B4A]'
+                              : isDark
+                              ? 'bg-zinc-600'
+                              : 'bg-stone-400'
+                          }`}
+                        />
+                      </div>
+                      <div
+                        className={`text-[10px] font-semibold mt-0.5 truncate ${
+                          isSelected
+                            ? isDark
+                              ? 'text-stone-200'
+                              : 'text-[#1C1C1E]'
+                            : isDark
+                            ? 'text-stone-400'
+                            : 'text-stone-600'
+                        }`}
+                      >
+                        {candidate.estimatedMinutes} min • {candidate.distanceKm} km
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Bottom Row: Primary Start Drift CTA + Save Button */}
+            <div className="flex items-center gap-2 pt-0.5">
+              <button
+                type="button"
+                onClick={onStartDrift}
+                disabled={isRouting}
+                className={`flex-1 py-2 px-4 rounded-2xl font-semibold text-xs text-white flex items-center justify-center gap-2 shadow-lg transition active:scale-98 ${
+                  activityMode === 'run'
+                    ? 'bg-emerald-600 hover:bg-emerald-500 shadow-emerald-600/25'
+                    : 'bg-[#FF6B4A] hover:bg-[#e85d3d] shadow-[#FF6B4A]/30'
+                } ${isRouting ? 'opacity-70 cursor-wait' : ''}`}
+              >
+                <Play className="w-3.5 h-3.5 fill-current" />
+                <span>
+                  {activityMode === 'run' ? 'Start Run Flow' : 'Start Drift'}
+                </span>
+                <span className="text-[10px] opacity-85 font-normal">
+                  • {displayDistanceKm} km ({route?.pois?.length || 0} stops)
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={onSaveRoute}
+                className={`px-3.5 py-2 rounded-2xl border text-xs font-semibold inline-flex items-center gap-1.5 transition active:scale-95 ${
+                  isCurrentRouteSaved
+                    ? isDark
+                      ? 'bg-amber-400/20 border-amber-400/40 text-amber-300'
+                      : 'bg-amber-500/15 border-amber-600/35 text-amber-900'
+                    : isDark
+                    ? 'bg-[#202024] border-white/15 text-stone-200 hover:border-white/30'
+                    : 'bg-[#FAF8F5] border-[#1C1C1E]/15 text-[#1C1C1E] hover:border-[#1C1C1E]/35'
+                }`}
+                title={
+                  isCurrentRouteSaved
+                    ? 'Saved to Hall of Fame'
+                    : 'Save route & stops to Hall of Fame'
+                }
+              >
+                <Bookmark
+                  className={`w-3.5 h-3.5 ${
+                    isCurrentRouteSaved ? 'fill-current text-[#D97706]' : ''
+                  }`}
+                />
+                <span>{isCurrentRouteSaved ? 'Saved' : 'Save'}</span>
+              </button>
+            </div>
+          </div>
+        ) : (
+          /* EXPANDED FULL CONTROL SHEET */
+          <>
+            {/* Grab Handle for Mobile Sheet */}
+            <div
+              className={`w-10 h-1 rounded-full mx-auto mb-2.5 sm:hidden ${
+                isDark ? 'bg-white/20' : 'bg-[#1C1C1E]/20'
+              }`}
+            />
+
+            {/* Top Sheet Header + One-Tap Show Map Collapse Toggle Pill */}
+            <div className="flex items-center justify-between gap-2 mb-2.5">
+              <div className="flex items-center gap-2 min-w-0">
+                <span
+                  className={`w-2 h-2 rounded-full flex-shrink-0 ${
+                    activityMode === 'run' ? 'bg-emerald-500' : 'bg-[#FF6B4A]'
+                  }`}
+                />
+                <span
+                  className={`text-[11px] font-bold uppercase tracking-widest truncate ${
+                    isDark ? 'text-stone-300' : 'text-stone-600'
+                  }`}
+                >
+                  {activityLabel} • {summaryMinutes} min • {routeShapeLabel}
+                </span>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => onTogglePanelExpanded && onTogglePanelExpanded()}
+                aria-label="Show Map"
+                className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full border text-[11px] font-semibold transition active:scale-95 flex-shrink-0 ${
+                  isDark
+                    ? 'bg-[#202024] border-white/15 text-[#F4F1EA] hover:border-[#FF6B4A]/60 hover:text-[#FF6B4A]'
+                    : 'bg-[#FAF8F5] border-[#1C1C1E]/15 text-[#1C1C1E] hover:border-[#FF6B4A]/60 hover:text-[#FF6B4A] shadow-sm'
+                }`}
+              >
+                <Map className="w-3 h-3 text-[#FF6B4A]" />
+                <span>Show Map</span>
+                <ChevronDown className="w-3 h-3 opacity-75" />
+              </button>
+            </div>
 
       {/* 1. Top Row: Timing Mode (Instant vs Planner) + Route Shape (Loop vs Point A -> B) */}
       <div className="grid grid-cols-2 gap-2">
@@ -329,7 +572,7 @@ export default function ControlPanel({
           {/* Autocomplete Suggestions Dropdown */}
           {showDropdown && suggestions.length > 0 && (
             <ul
-              className={`absolute left-0 right-0 bottom-full mb-1.5 z-30 rounded-2xl border overflow-hidden shadow-xl ${
+              className={`absolute left-0 right-0 top-full mt-1.5 z-30 rounded-2xl border overflow-hidden shadow-xl ${
                 isDark
                   ? 'bg-[#202024] border-white/15 text-[#F4F1EA]'
                   : 'bg-[#FAF8F5] border-[#1C1C1E]/15 text-[#1C1C1E]'
@@ -398,7 +641,7 @@ export default function ControlPanel({
             !isSearching &&
             suggestions.length === 0 && (
               <div
-                className={`absolute left-0 right-0 bottom-full mb-1.5 z-30 rounded-2xl border px-3.5 py-3 text-xs shadow-xl ${
+                className={`absolute left-0 right-0 top-full mt-1.5 z-30 rounded-2xl border px-3.5 py-3 text-xs shadow-xl ${
                   isDark
                     ? 'bg-[#202024] border-white/15 text-stone-300'
                     : 'bg-[#FAF8F5] border-[#1C1C1E]/15 text-stone-600'
@@ -1078,6 +1321,8 @@ export default function ControlPanel({
           <span>{isCurrentRouteSaved ? 'Saved' : 'Save'}</span>
         </button>
       </div>
+          </>
+        )}
       </section>
     </div>
   );
